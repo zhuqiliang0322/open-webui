@@ -636,6 +636,34 @@ def handle_responses_streaming_event(
 
     event_type = data.get('type', '')
 
+    def build_responses_error(response_data: dict) -> dict | None:
+        status = response_data.get('status')
+        error = response_data.get('error')
+
+        if isinstance(error, dict):
+            normalized_error = {k: v for k, v in error.items() if v is not None}
+            if normalized_error.get('message'):
+                if status:
+                    normalized_error.setdefault('status', status)
+                return normalized_error
+        elif isinstance(error, str) and error:
+            normalized_error = {
+                'message': error,
+                'type': 'responses_api_error',
+            }
+            if status:
+                normalized_error['status'] = status
+            return normalized_error
+
+        if status and status != 'completed':
+            return {
+                'message': f"Responses API stream ended with status '{status}'.",
+                'type': 'responses_api_error',
+                'status': status,
+            }
+
+        return None
+
     if event_type == 'response.output_item.added':
         item = data.get('item', {})
         if item:
@@ -923,11 +951,16 @@ def handle_responses_streaming_event(
                 if item.get('type') == 'reasoning' and item.get('status') != 'completed':
                     item['status'] = 'completed'
 
-        return new_output, {
+        metadata = {
             'usage': response_data.get('usage'),
             'done': True,
             'response_id': response_data.get('id'),
         }
+        error = build_responses_error(response_data)
+        if error:
+            metadata['error'] = error
+
+        return new_output, metadata
 
     elif event_type == 'response.in_progress':
         # State Machine Event: In Progress
@@ -936,11 +969,95 @@ def handle_responses_streaming_event(
 
     elif event_type == 'response.failed':
         # State Machine Event: Failed
-        error = data.get('response', {}).get('error', {})
+        response_data = data.get('response', {})
+        error = build_responses_error(response_data) or {}
         return current_output, {'error': error}
 
     else:
         return current_output, None
+
+
+def extract_stream_sideband_event(data: Any) -> tuple[Optional[dict[str, Any]], bool]:
+    """Extract UI events that should bypass normal content parsing.
+
+    Some OpenAI-compatible agent backends interleave status payloads with
+    standard content deltas. Those status chunks should update the message
+    status area without being treated as assistant text.
+    """
+
+    if not isinstance(data, dict):
+        return None, False
+
+    event = data.get('event')
+    if isinstance(event, dict):
+        return event, False
+
+    if data.get('type') == 'status' and isinstance(data.get('data'), dict):
+        return {'type': 'status', 'data': data['data']}, True
+
+    return None, False
+
+
+def sanitize_direct_stream_status_event(event: Any) -> Optional[dict[str, Any]]:
+    """Restrict direct-connection events to safe status payloads only."""
+
+    if not isinstance(event, dict) or event.get('type') != 'status':
+        return None
+
+    data = event.get('data')
+    if not isinstance(data, dict):
+        return None
+
+    sanitized: dict[str, Any] = {}
+
+    if 'description' in data:
+        sanitized['description'] = str(data.get('description') or '')
+
+    if 'done' in data:
+        sanitized['done'] = bool(data.get('done'))
+
+    if 'hidden' in data:
+        sanitized['hidden'] = bool(data.get('hidden'))
+
+    if isinstance(data.get('action'), str):
+        sanitized['action'] = data['action']
+
+    if isinstance(data.get('query'), str):
+        sanitized['query'] = data['query']
+
+    count = data.get('count')
+    if isinstance(count, int) and not isinstance(count, bool):
+        sanitized['count'] = count
+
+    queries = data.get('queries')
+    if isinstance(queries, list):
+        sanitized['queries'] = [str(query) for query in queries if isinstance(query, str)]
+
+    if not sanitized:
+        return None
+
+    return {'type': 'status', 'data': sanitized}
+
+
+async def emit_stream_sideband_event(request: Request, event_emitter, data: Any) -> bool:
+    """Emit sideband UI events from provider streams.
+
+    Returns True when the current chunk is fully handled and should be skipped
+    from the normal OpenAI/Responses streaming parser.
+    """
+
+    event, consume_chunk = extract_stream_sideband_event(data)
+
+    if not event:
+        return False
+
+    if getattr(request.state, 'direct', False):
+        event = sanitize_direct_stream_status_event(event)
+        if not event:
+            return False
+
+    await event_emitter(event)
+    return consume_chunk
 
 
 def get_source_context(sources: list, source_ids: dict = None, include_content: bool = True) -> str:
@@ -3871,8 +3988,8 @@ async def streaming_chat_response_handler(response, ctx):
                             )
 
                             if data:
-                                if 'event' in data and not getattr(request.state, 'direct', False):
-                                    await event_emitter(data.get('event', {}))
+                                if await emit_stream_sideband_event(request, event_emitter, data):
+                                    continue
 
                                 if 'selected_model_id' in data:
                                     model_id = data['selected_model_id']

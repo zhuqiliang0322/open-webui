@@ -44,6 +44,8 @@
 	let enable = true;
 	let apiVersion = '';
 	let apiType = ''; // '' = chat completions (default), 'responses' = Responses API
+	let workerApiBaseUrl = '';
+	let workerApiToken = '';
 
 	let headers = '';
 
@@ -187,7 +189,9 @@
 				auth_type,
 				headers: headers ? JSON.parse(headers) : undefined,
 				...(!ollama && azure ? { azure: true, api_version: apiVersion } : {}),
-				...(apiType ? { api_type: apiType } : {})
+				...(apiType ? { api_type: apiType } : {}),
+				...(workerApiBaseUrl ? { worker_api_base_url: workerApiBaseUrl } : {}),
+				...(workerApiToken ? { worker_api_token: workerApiToken } : {})
 			}
 		};
 
@@ -200,6 +204,10 @@
 		key = '';
 		auth_type = 'bearer';
 		prefixId = '';
+		apiVersion = '';
+		apiType = '';
+		workerApiBaseUrl = '';
+		workerApiToken = '';
 		tags = [];
 		modelIds = [];
 	};
@@ -226,6 +234,8 @@
 				azure = connection.config?.azure ?? false;
 				apiVersion = connection.config?.api_version ?? '';
 				apiType = connection.config?.api_type ?? '';
+				workerApiBaseUrl = connection.config?.worker_api_base_url ?? '';
+				workerApiToken = connection.config?.worker_api_token ?? '';
 			}
 		}
 	};
@@ -571,6 +581,50 @@
 											{$i18n.t('Chat Completions')}
 										{/if}
 									</button>
+								</div>
+							</div>
+						{/if}
+
+						{#if !ollama && !direct && apiType === 'responses'}
+							<div class="flex gap-2 mt-2">
+								<div class="flex flex-col w-full">
+									<label
+										for="worker-api-url-input"
+										class={`mb-0.5 text-xs text-gray-500
+								${($settings?.highContrastMode ?? false) ? 'text-gray-800 dark:text-gray-100' : ''}`}
+										>{$i18n.t('Worker API URL')}</label
+									>
+
+									<div class="flex-1">
+										<input
+											id="worker-api-url-input"
+											class={`w-full text-sm bg-transparent ${($settings?.highContrastMode ?? false) ? 'placeholder:text-gray-700 dark:placeholder:text-gray-100' : 'outline-hidden placeholder:text-gray-300 dark:placeholder:text-gray-700'}`}
+											type="text"
+											bind:value={workerApiBaseUrl}
+											placeholder="http://127.0.0.1:8090"
+											autocomplete="off"
+										/>
+									</div>
+								</div>
+							</div>
+
+							<div class="flex gap-2 mt-2">
+								<div class="flex flex-col w-full">
+									<label
+										for="worker-api-token-input"
+										class={`mb-0.5 text-xs text-gray-500
+								${($settings?.highContrastMode ?? false) ? 'text-gray-800 dark:text-gray-100' : ''}`}
+										>{$i18n.t('Worker API Token')}</label
+									>
+
+									<div class="flex-1">
+										<SensitiveInput
+											id="worker-api-token-input"
+											bind:value={workerApiToken}
+											placeholder={$i18n.t('Optional')}
+											required={false}
+										/>
+									</div>
 								</div>
 							</div>
 						{/if}

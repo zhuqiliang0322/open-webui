@@ -206,6 +206,24 @@ async def async_save_config(config):
     return True
 
 
+def load_json_dict_env(env_name: str, default: dict) -> dict:
+    raw_value = os.environ.get(env_name, '').strip()
+    if raw_value == '':
+        return default
+
+    try:
+        parsed_value = json.loads(raw_value)
+    except json.JSONDecodeError:
+        log.warning(f"Invalid JSON in '{env_name}', falling back to default value")
+        return default
+
+    if not isinstance(parsed_value, dict):
+        log.warning(f"'{env_name}' must be a JSON object, falling back to default value")
+        return default
+
+    return parsed_value
+
+
 T = TypeVar('T')
 
 ENABLE_PERSISTENT_CONFIG = os.environ.get('ENABLE_PERSISTENT_CONFIG', 'True').lower() == 'true'
@@ -1157,8 +1175,13 @@ OPENAI_API_BASE_URLS = PersistentConfig('OPENAI_API_BASE_URLS', 'openai.api_base
 OPENAI_API_CONFIGS = PersistentConfig(
     'OPENAI_API_CONFIGS',
     'openai.api_configs',
-    {},
+    load_json_dict_env('OPENAI_API_CONFIGS', {}),
 )
+
+OPENCLAW_WORKER_API_BASE_URL = os.environ.get('OPENCLAW_WORKER_API_BASE_URL', '').strip()
+OPENCLAW_WORKER_API_BASE_URL = OPENCLAW_WORKER_API_BASE_URL if OPENCLAW_WORKER_API_BASE_URL else 'http://127.0.0.1:8090'
+
+OPENCLAW_WORKER_API_TOKEN = os.environ.get('OPENCLAW_WORKER_API_TOKEN', '').strip()
 
 # Get the actual OpenAI API key based on the base URL
 OPENAI_API_KEY = ''

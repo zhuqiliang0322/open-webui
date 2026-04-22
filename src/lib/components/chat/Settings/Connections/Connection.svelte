@@ -21,6 +21,8 @@
 
 	let showConfigModal = false;
 	let showDeleteConfirmDialog = false;
+	$: requestPath = config?.api_type === 'responses' ? '/responses' : '/chat/completions';
+	$: requestUrl = `${url}${requestPath}`;
 </script>
 
 <AddConnectionModal
@@ -54,9 +56,7 @@
 <div class="flex w-full gap-2 items-center">
 	<Tooltip
 		className="w-full relative"
-		content={$i18n.t(`WebUI will make requests to "{{url}}/chat/completions"`, {
-			url
-		})}
+		content={`WebUI will make requests to "${requestUrl}"`}
 		placement="top-start"
 	>
 		{#if !(config?.enable ?? true)}

@@ -54,7 +54,15 @@
 	import { executeToolServer, getBackendConfig, getModels, getVersion } from '$lib/apis';
 	import { getSessionUser, updateUserTimezone, userSignOut } from '$lib/apis/auths';
 	import { getAllTags, getChatList } from '$lib/apis/chats';
-	import { chatCompletion } from '$lib/apis/openai';
+	import { chatCompletion, submitOpenClawWorker } from '$lib/apis/openai';
+	import {
+		convertResponsesResultToChatCompletion,
+		prepareDirectOpenAIRequest
+	} from '$lib/apis/openai/direct';
+	import {
+		buildOpenClawWorkerResponsesResult,
+		buildOpenClawWorkerResponsesStreamLines
+	} from '$lib/utils/openclaw-worker';
 	import {
 		addOpenAIConnection,
 		removeOpenAIConnection,
@@ -538,7 +546,7 @@
 				executeTool(data, cb, event.chat_id);
 			} else if (type === 'request:chat:completion') {
 				console.log(data, $socket.id);
-				const { session_id, channel, form_data, model } = data;
+				const { channel, form_data, model } = data;
 
 				try {
 					const directConnections = $settings?.directConnections ?? {};
@@ -556,10 +564,52 @@
 								form_data['model'] = form_data['model'].replace(`${prefixId}.`, ``);
 							}
 
-							const [res, controller] = await chatCompletion(
+							const { requestUrl, requestBody, isResponses } = prepareDirectOpenAIRequest(
+								OPENAI_API_URL,
+								API_CONFIG,
+								form_data
+							);
+
+							if (isResponses && form_data?.model?.startsWith('openclaw/')) {
+								const workerSubmission = await submitOpenClawWorker(
+									localStorage.token,
+									form_data.model,
+									requestBody
+								);
+
+								if (workerSubmission?.handled) {
+									const workerResponse =
+										workerSubmission.response ??
+										buildOpenClawWorkerResponsesResult(
+											form_data.model,
+											workerSubmission.ack ?? 'OpenClaw Worker'
+										);
+
+									if (form_data?.stream ?? false) {
+										cb({
+											status: true
+										});
+
+										for (const line of buildOpenClawWorkerResponsesStreamLines(workerResponse)) {
+											$socket?.emit(channel, line);
+										}
+									} else {
+										cb(convertResponsesResultToChatCompletion(workerResponse));
+									}
+
+									return;
+								}
+							}
+
+							const requestPath = requestUrl.endsWith('/responses')
+								? '/responses'
+								: '/chat/completions';
+
+							const [res] = await chatCompletion(
 								OPENAI_API_KEY,
-								form_data,
-								OPENAI_API_URL
+								requestBody,
+								requestUrl,
+								requestPath
 							);
 
 							if (res) {
@@ -577,25 +627,48 @@
 									// res will either be SSE or JSON
 									const reader = res.body.getReader();
 									const decoder = new TextDecoder();
+									let pendingLine = '';
 
 									const processStream = async () => {
-										while (true) {
+										let streamDone = false;
+										while (!streamDone) {
 											// Read data chunks from the response stream
 											const { done, value } = await reader.read();
 											if (done) {
+												streamDone = true;
 												break;
 											}
 
 											// Decode the received chunk
-											const chunk = decoder.decode(value, { stream: true });
+											pendingLine += decoder.decode(value, { stream: true });
 
-											// Process lines within the chunk
-											const lines = chunk.split('\n').filter((line) => line.trim() !== '');
+											// Process full lines only so SSE events survive chunk boundaries
+											const lines = pendingLine.split(/\r?\n/);
+											pendingLine = lines.pop() ?? '';
 
 											for (const line of lines) {
-												console.log(line);
-												$socket?.emit(channel, line);
+												if (!line.trim()) {
+													continue;
+												}
+
+												// Responses streams use event+data pairs. Open WebUI only
+												// needs the JSON data lines because the payload itself
+												// already carries its event type.
+												if (line.startsWith('event:') || line.startsWith(':')) {
+													continue;
+												}
+
+												if (line.startsWith('data:')) {
+													console.log(line);
+													$socket?.emit(channel, line);
+												}
 											}
+										}
+
+										const tail = pendingLine.trim();
+										if (tail.startsWith('data:')) {
+											console.log(tail);
+											$socket?.emit(channel, tail);
 										}
 									};
 
@@ -603,7 +676,7 @@
 									await processStream();
 								} else {
 									const data = await res.json();
-									cb(data);
+									cb(isResponses ? convertResponsesResultToChatCompletion(data) : data);
 								}
 							} else {
 								throw new Error('An error occurred while fetching the completion');
