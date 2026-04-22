@@ -1,10 +1,15 @@
 import asyncio
+from datetime import datetime
 import hashlib
 import json
 import logging
+import mimetypes
 import re
+import time
+from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urlparse
+from uuid import uuid4
 
 import aiohttp
 from aiocache import cached
@@ -31,6 +36,8 @@ from open_webui.models.groups import Groups
 from open_webui.utils.access_control import has_connection_access, check_model_access
 from open_webui.config import (
     CACHE_DIR,
+    OPENCLAW_WORKER_API_BASE_URL,
+    OPENCLAW_WORKER_API_TOKEN,
 )
 from open_webui.env import (
     MODELS_CACHE_TTL,
@@ -66,6 +73,73 @@ from open_webui.utils.headers import include_user_info_headers
 from open_webui.utils.anthropic import is_anthropic_url, get_anthropic_models
 
 log = logging.getLogger(__name__)
+
+OPENCLAW_WORKER_WAITING_RESULT_RE = re.compile(
+    r'(已启动第?一批|已启动子会话|正在等待|等待各角色|收到完成后|稍后|waiting for|once they finish|'
+    r'started the first batch|will summarize|will send.*later|多角色协调进行中|正在生成最终汇总|汇总生成中|'
+    r'release 正在生成)',
+    flags=re.IGNORECASE,
+)
+OPENCLAW_WORKER_THIN_RESULT_RE = re.compile(
+    r'^(信息不足[。！!]?|暂无(?:可展示)?(?:最终)?结果[。！!]?|无(?:法)?(?:提供)?(?:更多)?信息[。！!]?|'
+    r'没有(?:可展示)?(?:最终)?结果[。！!]?|无(?:可)?结果[。！!]?|no output|insufficient information[.!]?)$',
+    flags=re.IGNORECASE,
+)
+OPENCLAW_WORKER_FAILED_STATUS_RE = re.compile(
+    r'(?:^|\b)(?:fail|error|abort|model unloaded|context size has been exceeded)',
+    flags=re.IGNORECASE,
+)
+OPENCLAW_WORKER_TIMED_OUT_STATUS_RE = re.compile(r'(?:timed?\s*out|timeout|stall)', flags=re.IGNORECASE)
+OPENCLAW_WORKER_CANCELLED_STATUS_RE = re.compile(r'cancel', flags=re.IGNORECASE)
+OPENCLAW_WORKER_CONTROL_TOKEN_RE = re.compile(r'<\|[^>\n]*\|?>|<channel\|>', flags=re.IGNORECASE)
+OPENCLAW_WORKER_INTERMEDIATE_CHILD_RESULT_RE = re.compile(
+    r'^(?:now let me|let me |i(?: am|\'m) going to|i will |first[, ]|让我|我将|接下来|需要继续|继续(?:读取|查看|探索)|现在让我)',
+    flags=re.IGNORECASE,
+)
+OPENCLAW_WORKER_ARTIFACT_CODE_SPAN_RE = re.compile(r'`([^`\n]{1,200})`')
+OPENCLAW_WORKER_ARTIFACT_CONTEXT_AGENT_RE = re.compile(
+    r'\b(release|heavy|visual|coder|ops|main)\b',
+    flags=re.IGNORECASE,
+)
+OPENCLAW_WORKER_ARTIFACT_FILE_EXTENSIONS = {
+    '.csv',
+    '.css',
+    '.doc',
+    '.docx',
+    '.gif',
+    '.htm',
+    '.html',
+    '.jpeg',
+    '.jpg',
+    '.js',
+    '.json',
+    '.md',
+    '.mjs',
+    '.pdf',
+    '.png',
+    '.ppt',
+    '.pptx',
+    '.py',
+    '.scss',
+    '.sh',
+    '.sql',
+    '.svg',
+    '.ts',
+    '.tsx',
+    '.txt',
+    '.webp',
+    '.xls',
+    '.xlsx',
+    '.yaml',
+    '.yml',
+}
+OPENCLAW_WORKER_ARTIFACT_INLINE_MEDIA_TYPES = {
+    'application/javascript',
+    'application/json',
+    'application/pdf',
+    'application/xml',
+    'image/svg+xml',
+}
 
 
 ##########################################
@@ -233,6 +307,1199 @@ def get_microsoft_entra_id_access_token():
     except Exception as e:
         log.error(f'Error getting Microsoft Entra ID access token: {e}')
         return None
+
+
+def resolve_openclaw_worker_api_config(api_config: Optional[dict] = None) -> tuple[str, str]:
+    api_config = api_config or {}
+
+    worker_api_base_url = str(api_config.get('worker_api_base_url') or OPENCLAW_WORKER_API_BASE_URL or '').strip()
+    worker_api_token = str(api_config.get('worker_api_token') or OPENCLAW_WORKER_API_TOKEN or '').strip()
+
+    return worker_api_base_url.rstrip('/'), worker_api_token
+
+
+async def fetch_openclaw_worker_json(
+    worker_api_base_url: str,
+    worker_api_token: str,
+    method: str,
+    path: str,
+    payload: Optional[dict] = None,
+) -> dict:
+    headers = {}
+    if worker_api_token:
+        headers['Authorization'] = f'Bearer {worker_api_token}'
+    if payload is not None:
+        headers['Content-Type'] = 'application/json'
+
+    timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+
+    async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+        async with session.request(
+            method=method,
+            url=f'{worker_api_base_url}{path}',
+            headers=headers,
+            data=json.dumps(payload) if payload is not None else None,
+            ssl=AIOHTTP_CLIENT_SESSION_SSL,
+        ) as response:
+            text = await response.text()
+            try:
+                body = json.loads(text) if text else {}
+            except json.JSONDecodeError:
+                body = None
+
+            if not response.ok:
+                if isinstance(body, dict):
+                    detail = body.get('detail') or body.get('error') or text or f'HTTP Error: {response.status}'
+                else:
+                    detail = text or f'HTTP Error: {response.status}'
+                raise HTTPException(status_code=response.status, detail=detail)
+
+            if not isinstance(body, dict):
+                raise HTTPException(status_code=502, detail='Worker API returned an invalid response.')
+
+            return body
+
+
+def extract_text_from_responses_content(content: list | str | None) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ''
+
+    parts = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get('type')
+        if item_type in ('input_text', 'text', 'output_text'):
+            parts.append(str(item.get('text', '')))
+    return '\n'.join(part for part in parts if part).strip()
+
+
+def extract_openclaw_worker_prompt(payload: dict) -> str:
+    prompt_parts = []
+
+    for message in payload.get('messages') or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get('role') != 'user':
+            continue
+
+        content = message.get('content')
+        if isinstance(content, str):
+            text = content.strip()
+        else:
+            text = extract_text_from_responses_content(content)
+
+        if text:
+            prompt_parts.append(text)
+
+    prompt = '\n\n'.join(part for part in prompt_parts if part).strip()
+    if prompt:
+        return prompt
+
+    if isinstance(payload.get('input'), str):
+        return str(payload['input']).strip()
+
+    prompt_parts = []
+    for item in payload.get('input') or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get('type') != 'message':
+            continue
+        if item.get('role') != 'user':
+            continue
+        text = extract_text_from_responses_content(item.get('content'))
+        if text:
+            prompt_parts.append(text)
+
+    prompt = '\n\n'.join(part for part in prompt_parts if part).strip()
+    if prompt:
+        return prompt
+
+    return str(payload.get('instructions') or '').strip()
+
+
+def looks_like_openclaw_worker_candidate(prompt: str) -> bool:
+    normalized = (prompt or '').strip().lower()
+    if not normalized:
+        return False
+
+    return bool(
+        re.search(
+            r'(multi[\s-]?agent|multiple agents|all agents|协作|多 agent|多角色|并行|分工|角色分配|角色协同)',
+            normalized,
+        )
+    )
+
+
+def is_openclaw_worker_internal_metadata_prompt(prompt: str) -> bool:
+    normalized = (prompt or '').strip().lower()
+    if not normalized:
+        return False
+
+    if '### chat history:' not in normalized:
+        return False
+
+    return any(
+        marker in normalized
+        for marker in (
+            'generate a concise, 3-5 word title with an emoji summarizing the chat history',
+            'generate 1-3 broad tags categorizing the main themes of the chat history',
+            'suggest 3-5 relevant follow-up questions or prompts',
+            'generate a detailed prompt for am image generation task',
+        )
+    )
+
+
+def summarize_openclaw_worker_text(text: str, limit: int = 140) -> str:
+    normalized = re.sub(r'\s+', ' ', str(text or '').strip())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(1, limit - 1)].rstrip() + '…'
+
+
+def openclaw_worker_result_looks_waiting(text: str | None) -> bool:
+    normalized = str(text or '').strip()
+    return bool(normalized and OPENCLAW_WORKER_WAITING_RESULT_RE.search(normalized))
+
+
+def openclaw_worker_result_looks_thin(text: str | None) -> bool:
+    normalized = str(text or '').strip()
+    if not normalized:
+        return False
+    if normalized == '(no output)':
+        return True
+    return bool(OPENCLAW_WORKER_THIN_RESULT_RE.search(normalized))
+
+
+def openclaw_worker_subagent_status_outcome(status_text: str | None) -> str:
+    normalized = str(status_text or '').strip()
+    if not normalized:
+        return ''
+    if OPENCLAW_WORKER_CANCELLED_STATUS_RE.search(normalized):
+        return 'cancelled'
+    if OPENCLAW_WORKER_TIMED_OUT_STATUS_RE.search(normalized):
+        return 'timed_out'
+    if OPENCLAW_WORKER_FAILED_STATUS_RE.search(normalized):
+        return 'failed'
+    lowered = normalized.lower()
+    if any(keyword in lowered for keyword in ('complete', 'done', 'success', 'succeed')):
+        return 'completed'
+    return ''
+
+
+def openclaw_worker_child_result_looks_intermediate(text: str | None) -> bool:
+    normalized = summarize_openclaw_worker_text(str(text or '').strip(), limit=220)
+    if not normalized:
+        return False
+    if len(normalized) > 220:
+        return False
+    return bool(OPENCLAW_WORKER_INTERMEDIATE_CHILD_RESULT_RE.search(normalized))
+
+
+def normalize_openclaw_worker_child_result_preview(text: str | None) -> str:
+    normalized = summarize_openclaw_worker_text(str(text or '').strip(), limit=220)
+    if not normalized:
+        return ''
+    if openclaw_worker_result_looks_thin(normalized):
+        return ''
+    if OPENCLAW_WORKER_CONTROL_TOKEN_RE.search(normalized):
+        return ''
+    if openclaw_worker_result_looks_waiting(normalized):
+        return ''
+    if openclaw_worker_child_result_looks_intermediate(normalized):
+        return ''
+    return normalized
+
+
+def resolve_openclaw_agent_session_entry(root: Path, agent_id: str, session_key: str) -> tuple[dict, Path | None]:
+    store_path = root / 'config' / 'agents' / agent_id / 'sessions' / 'sessions.json'
+    if not store_path.is_file():
+        return {}, None
+
+    try:
+        store = json.loads(store_path.read_text(encoding='utf-8'))
+    except Exception:
+        return {}, None
+
+    if not isinstance(store, dict):
+        return {}, None
+
+    entry = store.get(session_key)
+    if not isinstance(entry, dict):
+        return {}, None
+
+    session_file = str(entry.get('sessionFile') or '').strip()
+    if session_file:
+        transcript_path = Path(session_file)
+        if transcript_path.is_file():
+            return entry, transcript_path
+
+    session_id = str(entry.get('sessionId') or '').strip()
+    if session_id:
+        transcript_path = root / 'config' / 'agents' / agent_id / 'sessions' / f'{session_id}.jsonl'
+        if transcript_path.is_file():
+            return entry, transcript_path
+
+    return entry, None
+
+
+def extract_openclaw_session_error_message(transcript_path: Path | None) -> str:
+    if transcript_path is None or not transcript_path.is_file():
+        return ''
+
+    for raw_line in reversed(transcript_path.read_text(encoding='utf-8', errors='replace').splitlines()):
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            record = json.loads(raw_line)
+        except Exception:
+            continue
+        if record.get('type') != 'message':
+            continue
+        message = record.get('message') if isinstance(record.get('message'), dict) else {}
+        error_message = str(message.get('errorMessage') or '').strip()
+        if error_message:
+            return error_message
+    return ''
+
+
+def extract_openclaw_session_latest_assistant_text(transcript_path: Path | None) -> str:
+    if transcript_path is None or not transcript_path.is_file():
+        return ''
+
+    for raw_line in reversed(transcript_path.read_text(encoding='utf-8', errors='replace').splitlines()):
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            record = json.loads(raw_line)
+        except Exception:
+            continue
+        if record.get('type') != 'message':
+            continue
+        message = record.get('message') if isinstance(record.get('message'), dict) else {}
+        if message.get('role') != 'assistant':
+            continue
+        contents = message.get('content') if isinstance(message.get('content'), list) else []
+        text_parts = [
+            str(item.get('text') or '').strip()
+            for item in contents
+            if isinstance(item, dict) and item.get('type') == 'text' and str(item.get('text') or '').strip()
+        ]
+        if text_parts:
+            return '\n\n'.join(text_parts)
+    return ''
+
+
+def inspect_openclaw_child_session(job: dict, session_key: str) -> dict | None:
+    root = infer_openclaw_root_from_worker_job(job)
+    session_key = str(session_key or '').strip()
+    match = re.match(r'agent:([^:]+):subagent:', session_key)
+    agent_id = match.group(1).strip() if match else ''
+    if root is None or not agent_id:
+        return None
+
+    entry, transcript_path = resolve_openclaw_agent_session_entry(root, agent_id, session_key)
+    if not entry and transcript_path is None:
+        return None
+
+    raw_status = str(entry.get('status') or '').strip()
+    error_message = extract_openclaw_session_error_message(transcript_path)
+    preview = normalize_openclaw_worker_child_result_preview(
+        extract_openclaw_session_latest_assistant_text(transcript_path)
+    )
+
+    outcome = openclaw_worker_subagent_status_outcome(raw_status)
+    if error_message and outcome not in {'failed', 'timed_out', 'cancelled'}:
+        outcome = 'failed'
+
+    terminal = bool(error_message) or outcome in {'completed', 'failed', 'timed_out', 'cancelled'}
+    if not terminal:
+        return {
+            'terminal': False,
+            'resultPreview': preview,
+        }
+
+    if outcome == 'timed_out':
+        detail = error_message or raw_status
+        status_text = f'timed out: {detail}' if detail else 'timed out'
+    elif outcome == 'cancelled':
+        detail = error_message or raw_status
+        status_text = f'cancelled: {detail}' if detail else 'cancelled'
+    elif outcome == 'failed':
+        detail = error_message or raw_status or 'subagent execution failed'
+        status_text = f'failed: {detail}'
+        preview = ''
+    else:
+        status_text = raw_status or 'completed'
+
+    return {
+        'terminal': True,
+        'status': summarize_openclaw_worker_text(status_text, limit=120),
+        'resultPreview': preview,
+    }
+
+
+def enrich_openclaw_worker_subagent_progress(job: dict, progress: Optional[dict]) -> Optional[dict]:
+    if not isinstance(progress, dict):
+        return progress
+
+    items = progress.get('items')
+    if not isinstance(items, list):
+        return progress
+
+    for raw_item in items:
+        if not isinstance(raw_item, dict):
+            continue
+        raw_item['resultPreview'] = normalize_openclaw_worker_child_result_preview(raw_item.get('resultPreview'))
+
+        session_key = str(raw_item.get('sessionKey') or '').strip()
+        child_session = inspect_openclaw_child_session(job, session_key) if session_key else None
+        if not isinstance(child_session, dict):
+            continue
+
+        if child_session.get('terminal'):
+            raw_item['state'] = 'completed'
+            if child_session.get('status'):
+                raw_item['status'] = child_session.get('status')
+            raw_item['resultPreview'] = str(child_session.get('resultPreview') or '').strip()
+            continue
+
+        if not raw_item.get('resultPreview') and child_session.get('resultPreview'):
+            raw_item['resultPreview'] = str(child_session.get('resultPreview') or '').strip()
+
+    progress['completedCount'] = sum(
+        1 for item in items if isinstance(item, dict) and str(item.get('state') or '').strip() == 'completed'
+    )
+    progress['activeCount'] = sum(
+        1 for item in items if isinstance(item, dict) and str(item.get('state') or '').strip() != 'completed'
+    )
+    progress['startedCount'] = max(int(progress.get('startedCount') or 0), len(items))
+    return progress
+
+
+def merge_openclaw_worker_subagent_progress(*payloads: Optional[dict]) -> Optional[dict]:
+    items_by_session: dict[str, dict[str, str]] = {}
+    reported_started_counts: list[int] = []
+
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        started_count = payload.get('startedCount')
+        if isinstance(started_count, int):
+            reported_started_counts.append(started_count)
+        items = payload.get('items')
+        if not isinstance(items, list):
+            continue
+
+        for raw_item in items:
+            if not isinstance(raw_item, dict):
+                continue
+            session_key = str(raw_item.get('sessionKey') or '').strip()
+            if not session_key:
+                continue
+
+            item = {
+                'sessionKey': session_key,
+                'agentId': str(raw_item.get('agentId') or '').strip(),
+                'task': str(raw_item.get('task') or '').strip(),
+                'state': str(raw_item.get('state') or '').strip(),
+                'status': str(raw_item.get('status') or '').strip(),
+                'resultPreview': str(raw_item.get('resultPreview') or '').strip(),
+            }
+            current = items_by_session.get(session_key)
+            if current is None:
+                items_by_session[session_key] = item
+                continue
+
+            merged = dict(current)
+            if item['state'] == 'completed' or not merged.get('state'):
+                merged['state'] = item['state'] or merged.get('state', '')
+            for field in ('agentId', 'task', 'status', 'resultPreview'):
+                candidate = item.get(field, '')
+                existing = merged.get(field, '')
+                if candidate and (not existing or len(candidate) > len(existing)):
+                    merged[field] = candidate
+            items_by_session[session_key] = merged
+
+    if not items_by_session and not reported_started_counts:
+        return None
+
+    items = list(items_by_session.values())
+    items.sort(key=lambda item: item.get('sessionKey') or '')
+    completed_count = sum(1 for item in items if item.get('state') == 'completed')
+    active_count = sum(1 for item in items if item.get('state') != 'completed')
+    started_count = max([len(items), *reported_started_counts]) if items or reported_started_counts else 0
+    return {
+        'startedCount': started_count,
+        'completedCount': completed_count,
+        'activeCount': active_count,
+        'items': items,
+    }
+
+
+def build_openclaw_worker_fallback_result(progress: Optional[dict], note: str = '') -> str:
+    if not isinstance(progress, dict):
+        return ''
+
+    items = progress.get('items')
+    if not isinstance(items, list):
+        return ''
+
+    ordered_agent_ids = ['visual', 'heavy', 'coder', 'release', 'ops', 'main']
+    normalized_items = [
+        item
+        for item in items
+        if isinstance(item, dict) and str(item.get('agentId') or '').strip()
+    ]
+    if not normalized_items:
+        return ''
+
+    agent_ids = {str(item.get('agentId') or '').strip() for item in normalized_items}
+    unordered_agent_ids = sorted(agent_id for agent_id in agent_ids if agent_id not in ordered_agent_ids)
+    display_agent_ids = [agent_id for agent_id in ordered_agent_ids if agent_id in agent_ids] + unordered_agent_ids
+
+    lines = ['多角色协作已收口。']
+    if note.strip():
+        lines.append(note.strip())
+
+    for display_agent_id in display_agent_ids:
+        matching_items = [
+            item for item in normalized_items if str(item.get('agentId') or '').strip() == display_agent_id
+        ]
+        if not matching_items:
+            continue
+        item = matching_items[-1]
+        result_preview = summarize_openclaw_worker_text(str(item.get('resultPreview') or '').strip(), limit=220)
+        task_text = summarize_openclaw_worker_text(str(item.get('task') or '').strip(), limit=80)
+        status_text = str(item.get('status') or '').strip()
+        state = str(item.get('state') or '').strip()
+        outcome = openclaw_worker_subagent_status_outcome(status_text)
+        meaningful_preview = normalize_openclaw_worker_child_result_preview(result_preview)
+
+        if outcome == 'failed':
+            summary = meaningful_preview or (
+                f'未成功返回可展示内容。状态：{status_text}' if status_text else '未成功返回可展示内容。'
+            )
+        elif outcome == 'timed_out':
+            summary = meaningful_preview or (f'处理超时。状态：{status_text}' if status_text else '处理超时。')
+        elif outcome == 'cancelled':
+            summary = meaningful_preview or (f'任务已取消。状态：{status_text}' if status_text else '任务已取消。')
+        elif state == 'completed':
+            summary = meaningful_preview or '已完成，但没有返回可展示内容。'
+        else:
+            summary = meaningful_preview or status_text or '仍在进行中。'
+
+        line = f'- {display_agent_id}：{summary}'
+        if task_text and task_text not in summary:
+            line += f' 任务：{task_text}'
+        lines.append(line)
+
+    return '\n'.join(lines).strip()
+
+
+def normalize_openclaw_worker_job_payload(payload: dict) -> dict:
+    transcript_progress = build_openclaw_worker_subagent_progress(payload)
+    payload['subagent_progress'] = merge_openclaw_worker_subagent_progress(
+        payload.get('subagent_progress') if isinstance(payload.get('subagent_progress'), dict) else None,
+        transcript_progress,
+    )
+    payload['subagent_progress'] = enrich_openclaw_worker_subagent_progress(payload, payload.get('subagent_progress'))
+
+    progress = payload.get('subagent_progress') if isinstance(payload.get('subagent_progress'), dict) else None
+    active_count = int(progress.get('activeCount') or 0) if isinstance(progress, dict) else 0
+    completed_count = int(progress.get('completedCount') or 0) if isinstance(progress, dict) else 0
+    final_text = str(payload.get('final_visible_text') or '').strip()
+    phase = str(payload.get('phase') or '').strip().lower()
+    status = str(payload.get('status') or '').strip().lower()
+    is_terminal = phase in {'completed', 'failed', 'timed_out', 'cancelled'} or status in {
+        'succeeded',
+        'failed',
+        'timed_out',
+        'cancelled',
+    }
+    looks_waiting = openclaw_worker_result_looks_waiting(final_text)
+    looks_thin = openclaw_worker_result_looks_thin(final_text)
+
+    if active_count > 0 and looks_waiting:
+        payload['phase'] = 'running'
+        payload['status'] = 'running'
+        payload['final_visible_text'] = ''
+        return payload
+
+    if is_terminal and completed_count > 0 and (not final_text or looks_waiting or looks_thin):
+        note = (
+            '主会话给出的最终结果过于简略，以下内容根据子任务结果整理。'
+            if looks_thin
+            else '主会话没有留下可直接展示的最终结果，以下内容根据已完成角色结果整理。'
+        )
+        payload['final_visible_text'] = build_openclaw_worker_fallback_result(
+            progress,
+            note=note,
+        )
+
+    payload['resolved_artifacts'] = build_openclaw_worker_resolved_artifacts(payload)
+    return payload
+
+
+def infer_openclaw_root_from_worker_job(job: dict) -> Optional[Path]:
+    candidate_fields = (
+        'report_json',
+        'report_markdown',
+        'prompt_file',
+        'result_file',
+        'log_file',
+    )
+    for field in candidate_fields:
+        raw_path = str(job.get(field) or '').strip()
+        if not raw_path:
+            continue
+        path = Path(raw_path).expanduser()
+        parents = [path] if path.is_dir() else []
+        parents.extend(path.parents)
+        for parent in parents:
+            if (parent / 'config' / 'openclaw.json').is_file():
+                return parent
+    return None
+
+
+def infer_openclaw_root_from_path(path: Path) -> Optional[Path]:
+    candidate = path.expanduser()
+    parents = [candidate] if candidate.is_dir() else []
+    parents.extend(candidate.parents)
+    for parent in parents:
+        if (parent / 'config' / 'openclaw.json').is_file():
+            return parent
+    return None
+
+
+def resolve_openclaw_worker_artifact_file_path(path: str) -> Optional[Path]:
+    raw_path = str(path or '').strip()
+    if not raw_path:
+        return None
+
+    artifact_path = Path(raw_path).expanduser()
+    if not artifact_path.is_absolute():
+        return None
+
+    resolved_path = artifact_path.resolve(strict=False)
+    if not resolved_path.is_file():
+        return None
+
+    root = infer_openclaw_root_from_path(resolved_path)
+    if root is None:
+        return None
+
+    work_root = root / 'work'
+    if not openclaw_worker_path_is_within_root(resolved_path, work_root):
+        return None
+
+    return resolved_path
+
+
+def guess_openclaw_worker_artifact_media_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == '.md':
+        return 'text/markdown'
+    if suffix == '.csv':
+        return 'text/csv'
+    if suffix == '.tsv':
+        return 'text/tab-separated-values'
+    if suffix == '.json':
+        return 'application/json'
+    if suffix == '.svg':
+        return 'image/svg+xml'
+
+    media_type, _ = mimetypes.guess_type(str(path))
+    return media_type or 'application/octet-stream'
+
+
+def openclaw_worker_artifact_media_type_should_inline(media_type: str) -> bool:
+    normalized = str(media_type or '').split(';', 1)[0].strip().lower()
+    return normalized.startswith(('text/', 'image/', 'audio/', 'video/')) or normalized in (
+        OPENCLAW_WORKER_ARTIFACT_INLINE_MEDIA_TYPES
+    )
+
+
+def build_openclaw_worker_artifact_response_headers(
+    path: Path,
+    *,
+    download: bool = False,
+) -> tuple[str, dict[str, str]]:
+    media_type = guess_openclaw_worker_artifact_media_type(path)
+    encoded_filename = quote(path.name)
+    disposition = (
+        'attachment'
+        if download or not openclaw_worker_artifact_media_type_should_inline(media_type)
+        else 'inline'
+    )
+    return media_type, {
+        'Content-Disposition': f"{disposition}; filename*=UTF-8''{encoded_filename}"
+    }
+
+
+def resolve_openclaw_worker_transcript_path(job: dict) -> Optional[Path]:
+    root = infer_openclaw_root_from_worker_job(job)
+    agent_id = str(job.get('agent_id') or '').strip()
+    session_key = str(job.get('worker_session_key') or '').strip()
+    if root is None or not agent_id or not session_key:
+        return None
+
+    store_path = root / 'config' / 'agents' / agent_id / 'sessions' / 'sessions.json'
+    if not store_path.is_file():
+        return None
+
+    try:
+        store = json.loads(store_path.read_text(encoding='utf-8'))
+    except Exception:
+        return None
+
+    def resolve_entry_path(entry: dict) -> Optional[Path]:
+        session_file = str(entry.get('sessionFile') or '').strip()
+        if session_file:
+            path = Path(session_file)
+            if path.is_file():
+                return path
+
+        session_id = str(entry.get('sessionId') or '').strip()
+        if not session_id:
+            return None
+
+        transcript_path = root / 'config' / 'agents' / agent_id / 'sessions' / f'{session_id}.jsonl'
+        return transcript_path if transcript_path.is_file() else None
+
+    def parse_job_timestamp(value: object) -> Optional[float]:
+        raw_value = str(value or '').strip()
+        if not raw_value:
+            return None
+        if raw_value.endswith('Z'):
+            raw_value = f'{raw_value[:-1]}+00:00'
+        try:
+            return datetime.fromisoformat(raw_value).timestamp()
+        except Exception:
+            return None
+
+    def has_subagent_activity(path: Path) -> bool:
+        try:
+            text = path.read_text(encoding='utf-8', errors='replace')
+        except Exception:
+            return False
+        return 'sessions_spawn' in text or '[Internal task completion event]' in text
+
+    entry = store.get(session_key) if isinstance(store, dict) else None
+    primary_path = resolve_entry_path(entry) if isinstance(entry, dict) else None
+    if primary_path and has_subagent_activity(primary_path):
+        return primary_path
+
+    if not isinstance(store, dict):
+        return primary_path
+
+    job_timestamp = (
+        parse_job_timestamp(job.get('started_at'))
+        or parse_job_timestamp(job.get('created_at'))
+        or parse_job_timestamp(job.get('updated_at'))
+    )
+    prefix = f'agent:{agent_id}:openresponses:'
+    candidates: list[tuple[int, float, float, Path]] = []
+
+    for candidate_key, candidate_entry in store.items():
+        if not isinstance(candidate_key, str) or not candidate_key.startswith(prefix):
+            continue
+        if not isinstance(candidate_entry, dict):
+            continue
+
+        transcript_path = resolve_entry_path(candidate_entry)
+        if transcript_path is None:
+            continue
+
+        started_at_ms = candidate_entry.get('startedAt')
+        updated_at_ms = candidate_entry.get('updatedAt')
+        try:
+            started_at = float(started_at_ms) / 1000 if started_at_ms is not None else None
+        except Exception:
+            started_at = None
+        try:
+            updated_at = float(updated_at_ms) / 1000 if updated_at_ms is not None else None
+        except Exception:
+            updated_at = None
+
+        reference_ts = started_at or updated_at or 0.0
+        if job_timestamp and reference_ts and reference_ts < job_timestamp - 300:
+            continue
+
+        candidates.append(
+            (
+                0 if has_subagent_activity(transcript_path) else 1,
+                abs(reference_ts - job_timestamp) if job_timestamp and reference_ts else float('inf'),
+                -(updated_at or 0.0),
+                transcript_path,
+            )
+        )
+
+    candidates.sort()
+    if candidates:
+        return candidates[0][3]
+
+    return primary_path
+
+
+def openclaw_worker_path_is_within_root(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def openclaw_worker_dedupe_existing_paths(paths: list[Path]) -> list[Path]:
+    unique_paths: list[Path] = []
+    seen: set[str] = set()
+    for raw_path in paths:
+        path = raw_path.expanduser()
+        if not path.is_file():
+            continue
+        normalized = str(path.resolve(strict=False))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_paths.append(path.resolve(strict=False))
+    return unique_paths
+
+
+def openclaw_worker_looks_like_artifact_reference(token: str) -> bool:
+    candidate = str(token or '').strip()
+    if not candidate or any(char in candidate for char in ('*', '?', '\n', '\r')):
+        return False
+    if candidate.startswith(('http://', 'https://', 'file://')):
+        return False
+    return Path(candidate).suffix.lower() in OPENCLAW_WORKER_ARTIFACT_FILE_EXTENSIONS
+
+
+def infer_openclaw_worker_artifact_context_agent(final_text: str, token: str) -> Optional[str]:
+    if not final_text or not token:
+        return None
+
+    for raw_line in final_text.splitlines():
+        if token not in raw_line:
+            continue
+        match = OPENCLAW_WORKER_ARTIFACT_CONTEXT_AGENT_RE.search(raw_line)
+        if match:
+            return match.group(1).strip().lower()
+    return None
+
+
+def resolve_openclaw_worker_artifact_path(
+    root: Path,
+    token: str,
+    *,
+    preferred_agent: Optional[str] = None,
+) -> Optional[Path]:
+    if root is None:
+        return None
+
+    candidate = str(token or '').strip()
+    if not openclaw_worker_looks_like_artifact_reference(candidate):
+        return None
+
+    work_root = root / 'work'
+    agent_workspaces_root = work_root / 'agent-workspaces'
+    reports_root = work_root / 'reports'
+    preferred_workspace = agent_workspaces_root / preferred_agent if preferred_agent else None
+
+    def score_path(path: Path) -> tuple[int, int]:
+        score = 0
+        if preferred_workspace and openclaw_worker_path_is_within_root(path, preferred_workspace):
+            score += 60
+        if openclaw_worker_path_is_within_root(path, agent_workspaces_root / 'release'):
+            score += 30
+        if openclaw_worker_path_is_within_root(path, reports_root):
+            score += 20
+        if openclaw_worker_path_is_within_root(path, agent_workspaces_root):
+            score += 10
+        return score, -len(path.parts)
+
+    path_token = Path(candidate).expanduser()
+    direct_candidates: list[Path] = []
+
+    if path_token.is_absolute():
+        if path_token.is_file() and openclaw_worker_path_is_within_root(path_token, root):
+            return path_token.resolve(strict=False)
+        return None
+
+    relative_bases = [base for base in (preferred_workspace, agent_workspaces_root, reports_root, work_root, root) if base]
+    if len(path_token.parts) > 1:
+        for base in relative_bases:
+            direct_candidates.append(base / path_token)
+    else:
+        for base in relative_bases:
+            direct_candidates.append(base / candidate)
+
+    resolved_direct = openclaw_worker_dedupe_existing_paths(direct_candidates)
+    if len(resolved_direct) == 1:
+        return resolved_direct[0]
+
+    search_roots = [base for base in (preferred_workspace, agent_workspaces_root, reports_root) if base and base.is_dir()]
+    search_matches: list[Path] = []
+    name = path_token.name
+    for search_root in search_roots:
+        search_matches.extend(search_root.rglob(name))
+
+    resolved_matches = openclaw_worker_dedupe_existing_paths(search_matches)
+    all_candidates = openclaw_worker_dedupe_existing_paths(resolved_direct + resolved_matches)
+    if not all_candidates:
+        return None
+    if len(all_candidates) == 1:
+        return all_candidates[0]
+
+    ranked: dict[tuple[int, int], list[Path]] = {}
+    for path in all_candidates:
+        ranked.setdefault(score_path(path), []).append(path)
+
+    best_score = max(ranked)
+    best_paths = ranked[best_score]
+    if len(best_paths) == 1:
+        return best_paths[0]
+    return None
+
+
+def build_openclaw_worker_resolved_artifacts(job: dict) -> list[dict[str, str]]:
+    root = infer_openclaw_root_from_worker_job(job)
+    final_text = str(job.get('final_visible_text') or '').strip()
+    if root is None or not final_text:
+        return []
+
+    artifacts: list[dict[str, str]] = []
+    seen_labels: set[str] = set()
+    for match in OPENCLAW_WORKER_ARTIFACT_CODE_SPAN_RE.finditer(final_text):
+        label = str(match.group(1) or '').strip()
+        if not label or label in seen_labels:
+            continue
+        preferred_agent = infer_openclaw_worker_artifact_context_agent(final_text, label)
+        resolved_path = resolve_openclaw_worker_artifact_path(
+            root,
+            label,
+            preferred_agent=preferred_agent,
+        )
+        if resolved_path is None:
+            continue
+        artifacts.append({'label': label, 'path': str(resolved_path)})
+        seen_labels.add(label)
+
+    return artifacts
+
+
+def build_openclaw_worker_subagent_progress(job: dict) -> Optional[dict]:
+    transcript_path = resolve_openclaw_worker_transcript_path(job)
+    if transcript_path is None or not transcript_path.is_file():
+        return None
+
+    pending_calls: dict[str, dict[str, str]] = {}
+    started_events: list[dict[str, str]] = []
+    completed_by_session: dict[str, dict[str, str]] = {}
+    seen_started: set[str] = set()
+
+    for raw_line in transcript_path.read_text(encoding='utf-8', errors='replace').splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            record = json.loads(raw_line)
+        except Exception:
+            continue
+        if record.get('type') != 'message':
+            continue
+
+        message = record.get('message') if isinstance(record.get('message'), dict) else {}
+        role = message.get('role')
+
+        if role == 'assistant':
+            contents = message.get('content') if isinstance(message.get('content'), list) else []
+            for item in contents:
+                if not isinstance(item, dict):
+                    continue
+                if item.get('type') != 'toolCall' or item.get('name') != 'sessions_spawn':
+                    continue
+                call_id = str(item.get('id') or '').strip()
+                arguments = item.get('arguments') if isinstance(item.get('arguments'), dict) else {}
+                pending_calls[call_id] = {
+                    'agentId': str(arguments.get('agentId') or '').strip(),
+                    'task': str(arguments.get('task') or '').strip(),
+                }
+            continue
+
+        if role == 'toolResult' and message.get('toolName') == 'sessions_spawn':
+            details = message.get('details') if isinstance(message.get('details'), dict) else {}
+            status = str(details.get('status') or '').strip().lower()
+            if status not in {'accepted', 'ok'}:
+                continue
+            session_key = str(details.get('childSessionKey') or '').strip()
+            if not session_key or session_key in seen_started:
+                continue
+            call_id = str(message.get('toolCallId') or '').strip()
+            call_meta = pending_calls.get(call_id) or {}
+            agent_id = str(call_meta.get('agentId') or '').strip()
+            if not agent_id:
+                match = re.match(r'agent:([^:]+):subagent:', session_key)
+                agent_id = match.group(1).strip() if match else ''
+            if not agent_id or agent_id == 'main':
+                continue
+            seen_started.add(session_key)
+            started_events.append(
+                {
+                    'sessionKey': session_key,
+                    'agentId': agent_id,
+                    'task': summarize_openclaw_worker_text(call_meta.get('task') or '', limit=120),
+                }
+            )
+            continue
+
+        if role != 'user':
+            continue
+
+        contents = message.get('content') if isinstance(message.get('content'), list) else []
+        text_blocks = [item.get('text') for item in contents if isinstance(item, dict) and isinstance(item.get('text'), str)]
+        combined_text = '\n'.join(text_blocks)
+        if '[Internal task completion event]' not in combined_text or 'source: subagent' not in combined_text:
+            continue
+
+        session_key_match = re.search(r'session_key:\s*(.+)', combined_text)
+        task_match = re.search(r'\ntask:\s*(.+)', combined_text)
+        status_match = re.search(r'\nstatus:\s*(.+)', combined_text)
+        result_match = re.search(
+            r'<<<BEGIN_UNTRUSTED_CHILD_RESULT>>>\n?(.*?)\n?<<<END_UNTRUSTED_CHILD_RESULT>>>',
+            combined_text,
+            flags=re.DOTALL,
+        )
+        session_key = session_key_match.group(1).strip() if session_key_match else ''
+        if not session_key:
+            continue
+        match = re.match(r'agent:([^:]+):subagent:', session_key)
+        agent_id = match.group(1).strip() if match else ''
+        if not agent_id or agent_id == 'main':
+            continue
+        completed_by_session[session_key] = {
+            'sessionKey': session_key,
+            'agentId': agent_id,
+            'task': summarize_openclaw_worker_text(task_match.group(1).strip() if task_match else '', limit=120),
+            'status': summarize_openclaw_worker_text(status_match.group(1).strip() if status_match else '', limit=80),
+            'resultPreview': summarize_openclaw_worker_text(result_match.group(1).strip() if result_match else '', limit=180),
+        }
+
+    if not started_events and not completed_by_session:
+        return None
+
+    items: list[dict[str, str]] = []
+    started_keys: set[str] = set()
+    for event in started_events:
+        session_key = event.get('sessionKey') or ''
+        completed = completed_by_session.get(session_key)
+        items.append(
+            {
+                'sessionKey': session_key,
+                'agentId': event.get('agentId') or '',
+                'task': completed.get('task') if completed and completed.get('task') else event.get('task') or '',
+                'state': 'completed' if completed else 'running',
+                'status': completed.get('status') if completed else '',
+                'resultPreview': completed.get('resultPreview') if completed else '',
+            }
+        )
+        started_keys.add(session_key)
+
+    for session_key, completed in completed_by_session.items():
+        if session_key in started_keys:
+            continue
+        items.append(
+            {
+                'sessionKey': session_key,
+                'agentId': completed.get('agentId') or '',
+                'task': completed.get('task') or '',
+                'state': 'completed',
+                'status': completed.get('status') or '',
+                'resultPreview': completed.get('resultPreview') or '',
+            }
+        )
+
+    active_count = sum(1 for item in items if item.get('state') != 'completed')
+    return {
+        'startedCount': len(started_events),
+        'completedCount': sum(1 for item in items if item.get('state') == 'completed'),
+        'activeCount': active_count,
+        'items': items,
+    }
+
+
+def should_dispatch_openclaw_worker(prompt: str, estimate: Optional[dict]) -> bool:
+    if not prompt.strip():
+        return False
+
+    if is_openclaw_worker_internal_metadata_prompt(prompt):
+        return False
+
+    if not isinstance(estimate, dict):
+        return looks_like_openclaw_worker_candidate(prompt)
+
+    if (
+        estimate.get('requiresOrchestration')
+        or estimate.get('isMultiAgent')
+        or estimate.get('isLongTask')
+        or estimate.get('needsFreshVerification')
+    ):
+        return True
+
+    return looks_like_openclaw_worker_candidate(prompt)
+
+
+def render_openclaw_worker_ack(job: dict, source_channel: str = 'openresponses') -> str:
+    estimate = job.get('estimate') or {}
+    first_batch = [item for item in (estimate.get('preferredInitialBatch') or []) if isinstance(item, str) and item]
+    first_batch_text = f"我会先安排 {'、'.join(first_batch)} 开始。" if first_batch else '我会先拆分任务，再安排第一步。'
+
+    return '\n'.join(
+        [
+            f"<!-- OpenClaw Worker | job id: `{job.get('id') or '-'}` -->",
+            '',
+            '已接到你的请求，正在按协作方式处理。',
+            first_batch_text,
+            '当前安排、子任务进度和最终结果会继续显示在这条消息里。',
+        ]
+    )
+
+
+def build_openclaw_worker_response(model: str, ack_text: str) -> dict:
+    return {
+        'id': f'resp_worker_{uuid4().hex}',
+        'object': 'response',
+        'created_at': int(time.time()),
+        'status': 'completed',
+        'model': model,
+        'output': [
+            {
+                'id': f'msg_worker_{uuid4().hex}',
+                'type': 'message',
+                'role': 'assistant',
+                'status': 'completed',
+                'content': [{'type': 'output_text', 'text': ack_text}],
+            }
+        ],
+        'usage': {
+            'input_tokens': 0,
+            'output_tokens': 0,
+            'total_tokens': 0,
+        },
+    }
+
+
+async def maybe_dispatch_openclaw_worker(
+    *,
+    model: str,
+    payload: dict,
+    url: str,
+    api_config: Optional[dict],
+    source_channel: str,
+) -> Optional[dict]:
+    if (api_config or {}).get('api_type') != 'responses':
+        return None
+
+    if not model.startswith('openclaw/'):
+        return None
+
+    hostname = urlparse(url).hostname or ''
+    if hostname not in {'127.0.0.1', 'localhost'}:
+        return None
+
+    worker_api_base_url, worker_api_token = resolve_openclaw_worker_api_config(api_config)
+    if not worker_api_base_url:
+        return None
+
+    prompt = extract_openclaw_worker_prompt(payload)
+    if not prompt:
+        return None
+    prompt_looks_multi_agent = looks_like_openclaw_worker_candidate(prompt)
+
+    metadata = {
+        'source': {
+            'channel': source_channel,
+        },
+        'allowBackgroundWorkerSubagents': True,
+    }
+
+    estimate = None
+    try:
+        estimate = await fetch_openclaw_worker_json(
+            worker_api_base_url,
+            worker_api_token,
+            'POST',
+            '/estimate',
+            {
+                'prompt': prompt,
+                'metadata': metadata,
+                'agent_id': 'main',
+            },
+        )
+    except Exception:
+        estimate = None
+
+    if not should_dispatch_openclaw_worker(prompt, estimate):
+        return None
+
+    if prompt_looks_multi_agent or (estimate or {}).get('requiresOrchestration') or (estimate or {}).get('isMultiAgent'):
+        agent_id = 'main'
+        job_type = 'agent_task'
+    else:
+        agent_id = str((estimate or {}).get('selectedAgent') or '').strip() or 'ops'
+        job_type = str((estimate or {}).get('recommendedJobType') or '').strip() or 'agent_task'
+
+    job = await fetch_openclaw_worker_json(
+        worker_api_base_url,
+        worker_api_token,
+        'POST',
+        '/jobs',
+        {
+            'job_type': job_type,
+            'prompt': prompt,
+            'agent_id': agent_id,
+            'metadata': metadata,
+        },
+    )
+    ack = render_openclaw_worker_ack(job, source_channel=source_channel)
+
+    return {
+        'handled': True,
+        'ack': ack,
+        'response': build_openclaw_worker_response(model, ack),
+        'job': job,
+    }
+
+
+async def resolve_openai_model_connection(
+    request: Request,
+    user: UserModel,
+    model_id: str,
+) -> tuple[int, dict, str, str, dict]:
+    models = request.app.state.OPENAI_MODELS
+    if not models or model_id not in models:
+        await get_all_models(request, user=user)
+        models = request.app.state.OPENAI_MODELS
+
+    model = models.get(model_id)
+    if not model:
+        raise HTTPException(
+            status_code=404,
+            detail='Model not found',
+        )
+
+    idx = model['urlIdx']
+    url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
+    key = request.app.state.config.OPENAI_API_KEYS[idx]
+    api_config = request.app.state.config.OPENAI_API_CONFIGS.get(
+        str(idx),
+        request.app.state.config.OPENAI_API_CONFIGS.get(url, {}),
+    )
+
+    return idx, model, url, key, api_config
 
 
 ##########################################
@@ -650,6 +1917,105 @@ async def get_models(request: Request, url_idx: Optional[int] = None, user=Depen
     return models
 
 
+@router.get('/worker/jobs/{job_id}')
+async def get_openclaw_worker_job(
+    request: Request,
+    job_id: str,
+    model: str,
+    user=Depends(get_verified_user),
+):
+    _, _, _, _, api_config = await resolve_openai_model_connection(request, user, model)
+
+    if api_config.get('api_type') != 'responses':
+        raise HTTPException(
+            status_code=400,
+            detail='Worker status is only available for Responses connections.',
+        )
+
+    worker_api_base_url, worker_api_token = resolve_openclaw_worker_api_config(api_config)
+    if not worker_api_base_url:
+        raise HTTPException(status_code=503, detail='Worker API is not configured.')
+
+    headers = {}
+    if worker_api_token:
+        headers['Authorization'] = f'Bearer {worker_api_token}'
+
+    timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with session.get(
+                f'{worker_api_base_url}/jobs/{job_id}',
+                headers=headers,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            ) as response:
+                text = await response.text()
+                try:
+                    payload = json.loads(text) if text else {}
+                except json.JSONDecodeError:
+                    payload = None
+
+                if not response.ok:
+                    detail = (
+                        payload.get('detail') if isinstance(payload, dict) else text or f'HTTP Error: {response.status}'
+                    )
+                    raise HTTPException(status_code=response.status, detail=detail)
+
+                if not isinstance(payload, dict):
+                    raise HTTPException(status_code=502, detail='Worker API returned an invalid response.')
+
+                return normalize_openclaw_worker_job_payload(payload)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception(f'Failed to fetch OpenClaw worker job {job_id}: {e}')
+        raise HTTPException(status_code=502, detail='Failed to fetch worker status.')
+
+
+@router.get('/worker/artifacts/content')
+async def get_openclaw_worker_artifact_content(
+    path: str,
+    download: bool = False,
+    user=Depends(get_verified_user),
+):
+    artifact_path = resolve_openclaw_worker_artifact_file_path(path)
+    if artifact_path is None:
+        raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    media_type, headers = build_openclaw_worker_artifact_response_headers(
+        artifact_path,
+        download=download,
+    )
+    return FileResponse(artifact_path, media_type=media_type, headers=headers)
+
+
+class OpenClawWorkerSubmitForm(BaseModel):
+    model_config = ConfigDict(extra='allow')
+
+    model: str
+    payload: dict
+
+
+@router.post('/worker/submit')
+async def submit_openclaw_worker(
+    request: Request,
+    form_data: OpenClawWorkerSubmitForm,
+    user=Depends(get_verified_user),
+):
+    _, _, url, _, api_config = await resolve_openai_model_connection(request, user, form_data.model)
+
+    result = await maybe_dispatch_openclaw_worker(
+        model=form_data.model,
+        payload=form_data.payload,
+        url=url,
+        api_config=api_config,
+        source_channel='openresponses',
+    )
+    if not result:
+        return {'handled': False}
+    return result
+
+
 class ConnectionVerificationForm(BaseModel):
     url: str
     key: str
@@ -1007,6 +2373,33 @@ def convert_responses_result(response: dict) -> dict:
     Extracts text from message output items so all downstream consumers
     (frontend tasks, get_content_from_response) work without modification.
     """
+    status = response.get('status')
+    error = response.get('error')
+
+    if isinstance(error, dict) and error.get('message'):
+        normalized_error = {k: v for k, v in error.items() if v is not None}
+        if status:
+            normalized_error.setdefault('status', status)
+        return {'error': normalized_error}
+
+    if isinstance(error, str) and error:
+        normalized_error = {
+            'message': error,
+            'type': 'responses_api_error',
+        }
+        if status:
+            normalized_error['status'] = status
+        return {'error': normalized_error}
+
+    if status and status != 'completed':
+        return {
+            'error': {
+                'message': f"Responses API request ended with status '{status}'.",
+                'type': 'responses_api_error',
+                'status': status,
+            }
+        }
+
     output_items = response.get('output', [])
 
     content = ''
@@ -1054,6 +2447,7 @@ async def generate_chat_completion(
         bypass_filter = True
 
     idx = 0
+    requested_model_id = form_data.get('model', '')
 
     payload = {**form_data}
     metadata = payload.pop('metadata', None)
@@ -1174,6 +2568,15 @@ async def generate_chat_completion(
     else:
         if is_responses:
             payload = convert_to_responses_payload(payload)
+            worker_dispatch = await maybe_dispatch_openclaw_worker(
+                model=requested_model_id,
+                payload=payload,
+                url=url,
+                api_config=api_config,
+                source_channel='openresponses',
+            )
+            if worker_dispatch:
+                return convert_responses_result(worker_dispatch['response'])
             request_url = f'{url}/responses'
         else:
             request_url = f'{url}/chat/completions'
