@@ -66,6 +66,7 @@
 		displayFileHandler
 	} from '$lib/utils';
 	import { AudioQueue } from '$lib/utils/audio';
+	import { humanizeOpenAIErrorMessage, normalizeChatMessageError } from '$lib/utils/openai-errors';
 
 	import {
 		archiveChatById,
@@ -490,7 +491,7 @@
 						}
 					}, 100);
 				} else if (type === 'chat:message:error') {
-					message.error = data.error;
+					message.error = normalizeChatMessageError(data.error, $i18n.t.bind($i18n));
 				} else if (type === 'chat:message:follow_ups') {
 					message.followUps = data.follow_ups;
 
@@ -2426,7 +2427,6 @@
 	};
 
 	const handleOpenAIError = async (error, responseMessage) => {
-		let errorMessage = '';
 		let innerError;
 
 		if (error) {
@@ -2434,24 +2434,11 @@
 		}
 
 		console.error(innerError);
-		if ('detail' in innerError) {
-			// FastAPI error
-			toast.error(innerError.detail);
-			errorMessage = innerError.detail;
-		} else if ('error' in innerError) {
-			// OpenAI error
-			if ('message' in innerError.error) {
-				toast.error(innerError.error.message);
-				errorMessage = innerError.error.message;
-			} else {
-				toast.error(innerError.error);
-				errorMessage = innerError.error;
-			}
-		} else if ('message' in innerError) {
-			// OpenAI error
-			toast.error(innerError.message);
-			errorMessage = innerError.message;
-		}
+		const errorMessage =
+			humanizeOpenAIErrorMessage(innerError, $i18n.t.bind($i18n)) ||
+			$i18n.t(`Uh-oh! There was an issue with the response.`);
+
+		toast.error(errorMessage.split('\n')[0]);
 
 		responseMessage.error = {
 			content: $i18n.t(`Uh-oh! There was an issue with the response.`) + '\n' + errorMessage

@@ -6,18 +6,26 @@
 	import ProfileImage from '../Messages/ProfileImage.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Heart from '$lib/components/icons/Heart.svelte';
+	import { humanizeOpenAIErrorMessage } from '$lib/utils/openai-errors';
 
 	const i18n = getContext('i18n');
 
 	type $$Props = NodeProps;
 	export let data: $$Props['data'];
+
+	$: errorContent = data?.message?.error
+		? humanizeOpenAIErrorMessage(
+				data.message.error?.content ?? data.message.content,
+				$i18n.t.bind($i18n)
+			)
+		: '';
 </script>
 
 <div
 	class="px-4 py-3 shadow-md rounded-xl dark:bg-black bg-white border border-gray-100 dark:border-gray-900 w-60 h-20 group"
 >
 	<Tooltip
-		content={data?.message?.error ? data.message.error.content : data.message.content}
+		content={data?.message?.error ? errorContent : data.message.content}
 		class="w-full"
 		allowHTML={false}
 	>
@@ -35,7 +43,7 @@
 					</div>
 
 					{#if data?.message?.error}
-						<div class="text-red-500 line-clamp-2 text-xs mt-0.5">{data.message.error.content}</div>
+						<div class="text-red-500 line-clamp-2 text-xs mt-0.5">{errorContent}</div>
 					{:else}
 						<div class="text-gray-500 line-clamp-2 text-xs mt-0.5">{data.message.content}</div>
 					{/if}
@@ -74,7 +82,7 @@
 
 					{#if data?.message?.error}
 						<div class="text-red-500 line-clamp-2 text-xs mt-0.5">
-							{data.message.error.content}
+							{errorContent}
 						</div>
 					{:else}
 						<div class="text-gray-500 line-clamp-2 text-xs mt-0.5">{data.message.content}</div>
