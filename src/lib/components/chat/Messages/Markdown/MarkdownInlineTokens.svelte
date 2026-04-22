@@ -8,8 +8,15 @@
 
 	const i18n = getContext('i18n');
 
+	import { getOpenClawWorkerArtifactContent } from '$lib/apis/openai';
 	import { WEBUI_BASE_URL } from '$lib/constants';
-	import { copyToClipboard, unescapeHtml } from '$lib/utils';
+	import { showControls, showFileNavPath } from '$lib/stores';
+	import { displayFileHandler, unescapeHtml } from '$lib/utils';
+	import {
+		extractOpenClawWorkerLocalFilePath,
+		parseOpenClawWorkerArtifactFilename,
+		shouldOpenClawWorkerArtifactInline
+	} from '$lib/utils/openclaw-worker';
 
 	import Image from '$lib/components/common/Image.svelte';
 	import KatexRenderer from './KatexRenderer.svelte';
@@ -45,10 +52,54 @@
 		return null;
 	};
 
+	const triggerArtifactDownload = (objectUrl: string, filename: string) => {
+		const anchor = document.createElement('a');
+		anchor.href = objectUrl;
+		anchor.download = filename;
+		anchor.rel = 'noopener noreferrer';
+		document.body.appendChild(anchor);
+		anchor.click();
+		anchor.remove();
+		setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+	};
+
+	const openOpenClawWorkerArtifact = async (path: string) => {
+		const response = await getOpenClawWorkerArtifactContent(localStorage.token, path);
+		const contentDisposition = response.headers.get('content-disposition');
+		const contentType = response.headers.get('content-type');
+		const filename = parseOpenClawWorkerArtifactFilename(contentDisposition) ?? path.split('/').pop() ?? 'artifact';
+		const objectUrl = URL.createObjectURL(await response.blob());
+
+		if (shouldOpenClawWorkerArtifactInline(contentType, contentDisposition)) {
+			const popup = window.open(objectUrl, '_blank', 'noopener,noreferrer');
+			if (!popup) {
+				triggerArtifactDownload(objectUrl, filename);
+				return;
+			}
+			setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+			return;
+		}
+
+		triggerArtifactDownload(objectUrl, filename);
+	};
+
 	/**
 	 * Handle link clicks - intercept same-origin app URLs for in-app navigation
 	 */
-	const handleLinkClick = (e: MouseEvent, href: string) => {
+	const handleLinkClick = async (e: MouseEvent, href: string) => {
+		const localFilePath = extractOpenClawWorkerLocalFilePath(href);
+		if (localFilePath) {
+			e.preventDefault();
+			try {
+				await openOpenClawWorkerArtifact(localFilePath);
+			} catch (error) {
+				console.error(error);
+				displayFileHandler(localFilePath, { showControls, showFileNavPath });
+				toast.error($i18n.t('Failed to open artifact directly. Showing file browser instead.'));
+			}
+			return;
+		}
+
 		try {
 			const url = new URL(href, window.location.origin);
 			// Check if same origin and an in-app route
@@ -73,8 +124,23 @@
 	{:else if token.type === 'html'}
 		<HtmlToken {id} {token} {onSourceClick} />
 	{:else if token.type === 'link'}
-		{@const noteId = getNoteIdFromHref(token.href)}
-		{#if noteId}
+		{@const localFilePath = extractOpenClawWorkerLocalFilePath(token.href)}
+		{@const noteId = localFilePath ? null : getNoteIdFromHref(token.href)}
+		{#if localFilePath}
+			<a
+				href={token.href}
+				class="codespan cursor-pointer"
+				title={localFilePath}
+				rel="nofollow"
+				on:click={(e) => handleLinkClick(e, token.href)}
+			>
+				{#if token.tokens}
+					<svelte:self id={`${id}-a`} tokens={token.tokens} {onSourceClick} {done} />
+				{:else}
+					{token.text}
+				{/if}
+			</a>
+		{:else if noteId}
 			<NoteLinkToken {noteId} href={token.href} />
 		{:else if token.tokens}
 			<a

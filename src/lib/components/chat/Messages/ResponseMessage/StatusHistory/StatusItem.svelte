@@ -141,7 +141,7 @@
 					{:else if status?.description === 'Searching the web'}
 						{$i18n.t('Searching the web')}
 					{:else}
-						{status?.description}
+						{$i18n.t(status?.description)}
 					{/if}
 				</div>
 			</div>

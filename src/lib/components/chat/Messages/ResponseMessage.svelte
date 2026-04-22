@@ -36,6 +36,8 @@
 		removeDetails,
 		removeAllDetails
 	} from '$lib/utils';
+	import { extractOpenClawWorkerJobId } from '$lib/utils/openclaw-worker';
+	import { humanizeOpenAIErrorMessage } from '$lib/utils/openai-errors';
 	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
 	import equal from 'fast-deep-equal';
 
@@ -61,6 +63,7 @@
 	import { fade } from 'svelte/transition';
 	import { flyAndScale } from '$lib/utils/transitions';
 	import RegenerateMenu from './ResponseMessage/RegenerateMenu.svelte';
+	import OpenClawWorkerStatus from './ResponseMessage/OpenClawWorkerStatus.svelte';
 	import StatusHistory from './ResponseMessage/StatusHistory.svelte';
 	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
 
@@ -121,6 +124,7 @@
 	export let selectedModels = [];
 
 	let message: MessageType = structuredClone(history.messages[messageId]);
+	let formattedErrorContent = '';
 	$: if (history.messages) {
 		const source = history.messages[messageId];
 		if (source) {
@@ -134,6 +138,9 @@
 			}
 		}
 	}
+	$: formattedErrorContent = message?.error
+		? humanizeOpenAIErrorMessage(message?.error?.content ?? message.content, $i18n.t.bind($i18n))
+		: '';
 
 	export let siblings;
 
@@ -168,6 +175,7 @@
 
 	let model = null;
 	$: model = $models.find((m) => m.id === message.model);
+	$: openclawWorkerJobId = extractOpenClawWorkerJobId(message?.content ?? '');
 
 	$: statusEntries = message?.statusHistory ?? [...(message?.status ? [message?.status] : [])];
 	$: hasVisibleStatus =
@@ -661,7 +669,19 @@
 			<div>
 				<div class="chat-{message.role} w-full min-w-full markdown-prose">
 					<div>
-						{#if model?.info?.meta?.capabilities?.status_updates ?? true}
+						{#if openclawWorkerJobId}
+							<OpenClawWorkerStatus
+								jobId={openclawWorkerJobId}
+								modelId={message.model}
+								{model}
+								{history}
+								{messageId}
+								{selectedModels}
+								{editCodeBlock}
+							/>
+						{/if}
+
+						{#if !openclawWorkerJobId && (model?.info?.meta?.capabilities?.status_updates ?? true)}
 							<StatusHistory statusHistory={message?.statusHistory} />
 						{/if}
 
@@ -783,7 +803,7 @@
 						>
 							{#if message.content === '' && !message.done && !message.error && !hasVisibleStatus}
 								<Skeleton />
-							{:else if message.content && message.error !== true}
+							{:else if !openclawWorkerJobId && message.content && message.error !== true}
 								<!-- always show message contents even if there's an error -->
 								<!-- unless message.error === true which is legacy error handling, where the error message is stored in message.content -->
 								<ContentRenderer
@@ -825,7 +845,9 @@
 							{/if}
 
 							{#if message?.error}
-								<Error content={message?.error?.content ?? message.content} />
+								<Error
+									content={formattedErrorContent || (message?.error?.content ?? message.content)}
+								/>
 							{/if}
 
 							{#if (message?.sources || message?.citations) && (model?.info?.meta?.capabilities?.citations ?? true)}
