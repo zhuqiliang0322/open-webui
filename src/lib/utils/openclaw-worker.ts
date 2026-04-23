@@ -10,6 +10,7 @@ const WAITING_RESULT_RE =
 	/(已启动第?一批|已启动子会话|正在等待|等待各角色|收到完成后|稍后|waiting for|once they finish|started the first batch|will summarize|will send.*later|多角色协调进行中|正在生成最终汇总|汇总生成中|release 正在生成)/i;
 const OPENCLAW_WORKER_LOCAL_FILE_PROTOCOL = 'openwebui:';
 const OPENCLAW_WORKER_LOCAL_FILE_HOST = 'local-file';
+const OPENCLAW_WORKER_IMAGE_SUFFIX_RE = /\.(avif|bmp|gif|jpe?g|png|svg|webp)$/i;
 const OPENCLAW_WORKER_INLINE_CONTENT_TYPES = new Set([
 	'application/javascript',
 	'application/json',
@@ -310,6 +311,21 @@ export const buildOpenClawWorkerRenderableFinalText = (
 		const href = buildOpenClawWorkerLocalFileHref(artifact.path);
 		const pattern = new RegExp('`' + escapeRegExp(artifact.label) + '`', 'g');
 		nextText = nextText.replace(pattern, `[${artifact.label}](${href})`);
+	}
+
+	const inlineImageMarkdown = resolvedArtifacts
+		.filter((artifact) => OPENCLAW_WORKER_IMAGE_SUFFIX_RE.test(artifact.path || artifact.label))
+		.map((artifact) => {
+			const href = buildOpenClawWorkerLocalFileHref(artifact.path);
+			const alt = artifact.path.split('/').pop()?.trim() || artifact.label || 'artifact';
+			const imageMarkdown = `![${alt}](${href})`;
+			const existingImagePattern = new RegExp(`!\\[[^\\]]*\\]\\(${escapeRegExp(href)}\\)`);
+			return existingImagePattern.test(nextText) ? '' : imageMarkdown;
+		})
+		.filter(Boolean);
+
+	if (inlineImageMarkdown.length > 0) {
+		nextText = `${nextText.trimEnd()}\n\n${inlineImageMarkdown.join('\n\n')}`;
 	}
 
 	return nextText;

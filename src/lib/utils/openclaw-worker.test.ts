@@ -4,6 +4,7 @@ import {
 	buildOpenClawWorkerCoordinatorBrief,
 	buildOpenClawWorkerResponsesResult,
 	buildOpenClawWorkerResponsesStreamLines,
+	buildOpenClawWorkerRenderableFinalText,
 	buildOpenClawWorkerStatusHistory,
 	extractOpenClawWorkerJobId,
 	parseOpenClawWorkerArtifactFilename,
@@ -200,6 +201,25 @@ describe('openclaw worker helpers', () => {
 	it('hides waiting placeholders from the final-result renderer', () => {
 		expect(isOpenClawWorkerRenderableFinalText('多角色协调进行中。')).toBe(false);
 		expect(isOpenClawWorkerRenderableFinalText('多角色协作已收口。')).toBe(true);
+	});
+
+	it('renders local image artifacts inline in the final result', () => {
+		const rendered = buildOpenClawWorkerRenderableFinalText(
+			'任务已完成。\n`~/OpenClaw/downloads/orange_cat_poster.png`',
+			[
+				{
+					label: '~/OpenClaw/downloads/orange_cat_poster.png',
+					path: '/Users/panda/OpenClaw/downloads/orange_cat_poster.png'
+				}
+			]
+		);
+
+		expect(rendered).toContain(
+			'[~/OpenClaw/downloads/orange_cat_poster.png](openwebui://local-file?path=%2FUsers%2Fpanda%2FOpenClaw%2Fdownloads%2Forange_cat_poster.png)'
+		);
+		expect(rendered).toContain(
+			'![orange_cat_poster.png](openwebui://local-file?path=%2FUsers%2Fpanda%2FOpenClaw%2Fdownloads%2Forange_cat_poster.png)'
+		);
 	});
 
 	it('parses artifact filenames from content disposition headers', () => {

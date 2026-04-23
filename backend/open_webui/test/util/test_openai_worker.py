@@ -1,4 +1,6 @@
 import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -28,7 +30,6 @@ def test_resolve_openclaw_worker_api_config_falls_back_to_env(monkeypatch):
 
     assert base_url == 'http://127.0.0.1:8090'
     assert token == 'env-token'
-
 
 def test_extract_openclaw_worker_prompt_prefers_user_message_text():
     prompt = openai.extract_openclaw_worker_prompt(
@@ -68,6 +69,139 @@ def test_should_dispatch_openclaw_worker_for_multi_agent_prompt_without_estimate
         'simulate a task that requires multiple agents to collaborate',
         None,
     )
+
+
+def test_should_dispatch_openclaw_worker_for_generic_poster_generation_prompt():
+    assert openai.should_dispatch_openclaw_worker(
+        '生成一张新年海报 2K分辨率 3d 效果，高级但中国风',
+        {'recommendedJobType': 'visual_batch'},
+    )
+
+
+def test_should_not_treat_copywriting_request_as_visual_generation_candidate():
+    assert not openai.looks_like_openclaw_visual_generation_candidate('写一段新年海报文案，要高级一点。')
+
+
+def test_should_dispatch_openclaw_worker_for_visual_attachment_without_estimate():
+    assert openai.should_dispatch_openclaw_worker('', None, has_visual_attachments=True)
+
+
+@pytest.mark.asyncio
+async def test_resolve_openclaw_worker_attachments_materializes_data_url(monkeypatch, tmp_path):
+    monkeypatch.setattr(openai, 'CACHE_DIR', tmp_path)
+
+    image_data_url = (
+        'data:image/png;base64,'
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO6N3ioAAAAASUVORK5CYII='
+    )
+
+    attachments = await openai.resolve_openclaw_worker_attachments(
+        {
+            'input': [
+                {
+                    'type': 'message',
+                    'role': 'user',
+                    'content': [
+                        {'type': 'input_image', 'image_url': image_data_url},
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert len(attachments) == 1
+    attachment = attachments[0]
+
+    assert attachment['type'] == 'image/png'
+    assert attachment['url'] is None
+    assert attachment['name'] == 'openclaw-worker-input.png'
+    assert attachment['path']
+    assert Path(attachment['path']).is_file()
+    assert Path(attachment['path']).parent == tmp_path / 'openclaw' / 'worker_inputs'
+    assert Path(attachment['path']).suffix == '.png'
+
+
+def test_prune_openclaw_worker_input_cache_removes_expired_and_excess_files(tmp_path):
+    cache_root = tmp_path / 'worker_inputs'
+    cache_root.mkdir()
+
+    old_path = cache_root / 'old.png'
+    keep_a = cache_root / 'keep-a.png'
+    keep_b = cache_root / 'keep-b.png'
+    trim_path = cache_root / 'trim.png'
+
+    old_path.write_bytes(b'old')
+    keep_a.write_bytes(b'a')
+    keep_b.write_bytes(b'b')
+    trim_path.write_bytes(b'trim')
+
+    now = 1_777_000_000
+    timestamps = {
+        old_path: now - 100,
+        keep_a: now - 10,
+        keep_b: now - 5,
+        trim_path: now - 1,
+    }
+    for path, mtime in timestamps.items():
+        path.touch()
+        os.utime(path, (mtime, mtime))
+
+    openai.prune_openclaw_worker_input_cache(
+        cache_root,
+        max_files=2,
+        max_age_seconds=30,
+    )
+
+    assert not old_path.exists()
+    assert not keep_a.exists()
+    assert keep_b.exists()
+    assert trim_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_resolve_openclaw_worker_attachments_skips_inaccessible_file_ids(monkeypatch):
+    class DummyFile:
+        user_id = 'owner-2'
+        filename = 'avatar.png'
+        path = '/Users/panda/open-webui/.data/uploads/test-avatar.png'
+        meta = {'content_type': 'image/png'}
+
+    class DummyUser:
+        id = 'user-1'
+        role = 'user'
+
+    async def fake_get_file_by_id(file_id, db=None):
+        assert file_id == '3a1c4e65-ad4e-4096-bb39-13fd52917578'
+        return DummyFile()
+
+    async def fake_has_access_to_file(file_id, access_type, user, db=None):
+        assert file_id == '3a1c4e65-ad4e-4096-bb39-13fd52917578'
+        assert access_type == 'read'
+        assert user.id == 'user-1'
+        return False
+
+    monkeypatch.setattr(openai.Files, 'get_file_by_id', fake_get_file_by_id)
+    monkeypatch.setattr(openai, 'has_access_to_file', fake_has_access_to_file)
+
+    attachments = await openai.resolve_openclaw_worker_attachments(
+        {
+            'input': [
+                {
+                    'type': 'message',
+                    'role': 'user',
+                    'content': [
+                        {
+                            'type': 'input_image',
+                            'image_url': '3a1c4e65-ad4e-4096-bb39-13fd52917578',
+                        },
+                    ],
+                }
+            ]
+        },
+        user=DummyUser(),
+    )
+
+    assert attachments == []
 
 
 def test_should_not_dispatch_openclaw_worker_for_title_generation_prompt():
@@ -326,6 +460,20 @@ def test_build_openclaw_worker_subagent_progress_falls_back_to_openresponses_tra
                             'role': 'assistant',
                             'content': [
                                 {
+                                    'type': 'text',
+                                    'text': '<!-- OpenClaw Worker | job id: `job-web-002` -->',
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        'type': 'message',
+                        'message': {
+                            'role': 'assistant',
+                            'content': [
+                                {
                                     'type': 'toolCall',
                                     'id': 'call-1',
                                     'name': 'sessions_spawn',
@@ -388,6 +536,7 @@ def test_build_openclaw_worker_subagent_progress_falls_back_to_openresponses_tra
 
     progress = openai.build_openclaw_worker_subagent_progress(
         {
+            'id': 'job-web-002',
             'agent_id': 'main',
             'worker_session_key': 'agent:main:worker:job-web-002',
             'report_json': str(report_path),
@@ -410,6 +559,126 @@ def test_build_openclaw_worker_subagent_progress_falls_back_to_openresponses_tra
             }
         ],
     }
+
+
+def test_build_openclaw_worker_subagent_progress_ignores_auxiliary_openresponses_transcript(tmp_path):
+    root = tmp_path / 'OpenClaw'
+    sessions_dir = root / 'config' / 'agents' / 'main' / 'sessions'
+    worker_transcript_path = sessions_dir / 'worker-session.jsonl'
+    auxiliary_transcript_path = sessions_dir / 'title-session.jsonl'
+    report_path = root / 'work' / 'reports' / 'jobs' / '2026-04-22' / 'job-web-003.json'
+
+    sessions_dir.mkdir(parents=True)
+    report_path.parent.mkdir(parents=True)
+    (root / 'config' / 'openclaw.json').write_text('{}', encoding='utf-8')
+    report_path.write_text('{}', encoding='utf-8')
+    (sessions_dir / 'sessions.json').write_text(
+        json.dumps(
+            {
+                'agent:main:worker:job-web-003': {
+                    'sessionFile': str(worker_transcript_path),
+                    'startedAt': 1_776_825_000_000,
+                    'updatedAt': 1_776_825_005_000,
+                },
+                'agent:main:openresponses:webchat-aux': {
+                    'sessionFile': str(auxiliary_transcript_path),
+                    'startedAt': 1_776_825_001_000,
+                    'updatedAt': 1_776_825_006_000,
+                },
+            }
+        ),
+        encoding='utf-8',
+    )
+    worker_transcript_path.write_text(
+        json.dumps(
+            {
+                'type': 'message',
+                'message': {
+                    'role': 'assistant',
+                    'content': [{'type': 'text', 'text': 'worker wrapper only'}],
+                },
+            }
+        )
+        + '\n',
+        encoding='utf-8',
+    )
+    auxiliary_transcript_path.write_text(
+        '\n'.join(
+            [
+                json.dumps(
+                    {
+                        'type': 'message',
+                        'message': {
+                            'role': 'user',
+                            'content': [
+                                {
+                                    'type': 'text',
+                                    'text': '\n'.join(
+                                        [
+                                            '### Task:',
+                                            'Generate a concise, 3-5 word title with an emoji summarizing the chat history.',
+                                            '### Chat History:',
+                                            '<chat_history>',
+                                            'ASSISTANT: <!-- OpenClaw Worker | job id: `job-web-003` -->',
+                                            '</chat_history>',
+                                        ]
+                                    ),
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        'type': 'message',
+                        'message': {
+                            'role': 'assistant',
+                            'content': [
+                                {
+                                    'type': 'toolCall',
+                                    'id': 'call-1',
+                                    'name': 'sessions_spawn',
+                                    'arguments': {
+                                        'agentId': 'heavy',
+                                        'task': '给 1 条中文风险提示。',
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        'type': 'message',
+                        'message': {
+                            'role': 'toolResult',
+                            'toolName': 'sessions_spawn',
+                            'toolCallId': 'call-1',
+                            'details': {
+                                'status': 'accepted',
+                                'childSessionKey': 'agent:heavy:subagent:child-1',
+                            },
+                            'content': [],
+                        },
+                    }
+                ),
+            ]
+        )
+        + '\n',
+        encoding='utf-8',
+    )
+
+    progress = openai.build_openclaw_worker_subagent_progress(
+        {
+            'id': 'job-web-003',
+            'agent_id': 'main',
+            'worker_session_key': 'agent:main:worker:job-web-003',
+            'report_json': str(report_path),
+            'created_at': '2026-04-22T02:45:00+00:00',
+        }
+    )
+
+    assert progress is None
 
 
 def test_merge_openclaw_worker_subagent_progress_prefers_richer_transcript_snapshot():
@@ -753,6 +1022,33 @@ def test_normalize_openclaw_worker_job_payload_prefers_contextual_artifact_path(
             'label': 'reports/validation-summary.md',
             'path': str(release_validation_summary.resolve()),
         }
+    ]
+
+
+def test_normalize_openclaw_worker_job_payload_includes_media_urls_as_artifacts(tmp_path):
+    root = tmp_path / 'OpenClaw'
+    report_path = root / 'work' / 'reports' / 'jobs' / '2026-04-23' / 'job-web-image.json'
+    image_path = root / 'work' / 'tmp' / 'dreamina' / 'job-123' / 'poster.png'
+
+    report_path.parent.mkdir(parents=True)
+    image_path.parent.mkdir(parents=True)
+    (root / 'config').mkdir(parents=True)
+    (root / 'config' / 'openclaw.json').write_text('{}', encoding='utf-8')
+    report_path.write_text('{}', encoding='utf-8')
+    image_path.write_bytes(b'png')
+
+    payload = openai.normalize_openclaw_worker_job_payload(
+        {
+            'report_json': str(report_path),
+            'phase': 'completed',
+            'status': 'succeeded',
+            'final_visible_text': '新年海报已生成并下载完成。',
+            'media_urls': [str(image_path.resolve())],
+        }
+    )
+
+    assert payload['resolved_artifacts'] == [
+        {'label': 'poster.png', 'path': str(image_path.resolve())},
     ]
 
 
@@ -1198,6 +1494,100 @@ async def test_maybe_dispatch_openclaw_worker_returns_ack_for_chat_payload(monke
 
 
 @pytest.mark.asyncio
+async def test_maybe_dispatch_openclaw_worker_accepts_non_responses_connection(monkeypatch):
+    async def fake_fetch_openclaw_worker_json(worker_api_base_url, worker_api_token, method, path, payload=None):
+        if path == '/estimate':
+            return {
+                'selectedAgent': 'visual',
+                'recommendedJobType': 'visual_batch',
+                'routeReason': ['visual-classified request'],
+            }
+
+        if path == '/jobs':
+            return {
+                'id': 'job-web-chat-123',
+                'agent_id': payload['agent_id'],
+                'selected_model_public': 'gemma-4-26b-a4b-it',
+                'estimate': {
+                    'selectedAgent': payload['agent_id'],
+                    'routeReason': ['visual-classified request'],
+                    'preferredInitialBatch': [payload['agent_id']],
+                },
+            }
+
+        raise AssertionError(f'unexpected worker path: {path}')
+
+    monkeypatch.setattr(openai, 'fetch_openclaw_worker_json', fake_fetch_openclaw_worker_json)
+
+    result = await openai.maybe_dispatch_openclaw_worker(
+        model='openclaw/main',
+        payload={
+            'messages': [
+                {
+                    'role': 'user',
+                    'content': 'Generate one real Dreamina text-to-image now and show the image in this chat with the submit_id.',
+                }
+            ]
+        },
+        url='http://127.0.0.1:18789/v1',
+        api_config={
+            'worker_api_base_url': 'http://127.0.0.1:8090',
+        },
+        source_channel='openresponses',
+    )
+
+    assert result is not None
+    assert result['handled'] is True
+    assert result['job']['id'] == 'job-web-chat-123'
+    assert '<!-- OpenClaw Worker | job id: `job-web-chat-123` -->' in result['ack']
+
+
+@pytest.mark.asyncio
+async def test_get_openclaw_worker_job_accepts_non_responses_connection(monkeypatch):
+    async def fake_resolve_openai_model_connection(request, user, model):
+        return None, None, None, None, {'worker_api_base_url': 'http://127.0.0.1:8090'}
+
+    class FakeResponse:
+        ok = True
+        status = 200
+
+        async def text(self):
+            return json.dumps({'id': 'job-web-chat-123', 'status': 'running'})
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url, headers=None, ssl=None):
+            return FakeResponse()
+
+    monkeypatch.setattr(openai, 'resolve_openai_model_connection', fake_resolve_openai_model_connection)
+    monkeypatch.setattr(openai.aiohttp, 'ClientSession', FakeSession)
+    monkeypatch.setattr(openai, 'normalize_openclaw_worker_job_payload', lambda payload: payload)
+
+    result = await openai.get_openclaw_worker_job(
+        request=object(),
+        job_id='job-web-chat-123',
+        model='openclaw/main',
+        user=object(),
+    )
+
+    assert result == {'id': 'job-web-chat-123', 'status': 'running'}
+
+
+@pytest.mark.asyncio
 async def test_maybe_dispatch_openclaw_worker_forces_main_for_multi_agent_prompt(monkeypatch):
     captured_job_payloads = []
 
@@ -1247,3 +1637,120 @@ async def test_maybe_dispatch_openclaw_worker_forces_main_for_multi_agent_prompt
     assert result is not None
     assert captured_job_payloads[0]['agent_id'] == 'main'
     assert captured_job_payloads[0]['job_type'] == 'agent_task'
+
+
+@pytest.mark.asyncio
+async def test_maybe_dispatch_openclaw_worker_routes_image_attachment_payload(monkeypatch):
+    captured_calls = {}
+
+    class DummyFile:
+        filename = 'avatar.png'
+        path = '/Users/panda/open-webui/.data/uploads/test-avatar.png'
+        meta = {'content_type': 'image/png'}
+
+    async def fake_get_file_by_id(file_id, db=None):
+        assert file_id == '3a1c4e65-ad4e-4096-bb39-13fd52917578'
+        return DummyFile()
+
+    async def fake_fetch_openclaw_worker_json(worker_api_base_url, worker_api_token, method, path, payload=None):
+        if path == '/estimate':
+            captured_calls['estimate'] = payload
+            return {
+                'selectedAgent': 'main',
+                'recommendedJobType': 'agent_task',
+                'routeReason': ['fallback'],
+            }
+
+        if path == '/jobs':
+            captured_calls['job'] = payload
+            return {
+                'id': 'job-visual-123',
+                'agent_id': payload['agent_id'],
+                'selected_model_public': 'gemma-4-26b-a4b-it',
+                'estimate': {
+                    'selectedAgent': payload['agent_id'],
+                    'routeReason': ['visual attachment forced'],
+                    'preferredInitialBatch': [payload['agent_id']],
+                },
+            }
+
+        raise AssertionError(f'unexpected worker path: {path}')
+
+    monkeypatch.setattr(openai.Files, 'get_file_by_id', fake_get_file_by_id)
+    monkeypatch.setattr(openai, 'fetch_openclaw_worker_json', fake_fetch_openclaw_worker_json)
+
+    result = await openai.maybe_dispatch_openclaw_worker(
+        model='openclaw/main',
+        payload={
+            'input': [
+                {
+                    'type': 'message',
+                    'role': 'user',
+                    'content': [
+                        {'type': 'input_text', 'text': '优化这个图片细节和尺寸。'},
+                        {
+                            'type': 'input_image',
+                            'image_url': '3a1c4e65-ad4e-4096-bb39-13fd52917578',
+                        },
+                    ],
+                }
+            ]
+        },
+        url='http://127.0.0.1:18789/v1',
+        api_config={
+            'api_type': 'responses',
+            'worker_api_base_url': 'http://127.0.0.1:8090',
+        },
+        source_channel='openresponses',
+    )
+
+    assert result is not None
+    assert result['handled'] is True
+    assert result['job']['id'] == 'job-visual-123'
+    assert captured_calls['estimate']['metadata']['attachments'][0]['path'] == '/Users/panda/open-webui/.data/uploads/test-avatar.png'
+    assert captured_calls['job']['agent_id'] == 'visual'
+    assert captured_calls['job']['job_type'] == 'visual_batch'
+
+
+@pytest.mark.asyncio
+async def test_maybe_dispatch_openclaw_worker_skips_remote_worker_for_path_backed_attachments(monkeypatch):
+    class DummyFile:
+        filename = 'avatar.png'
+        path = '/Users/panda/open-webui/.data/uploads/test-avatar.png'
+        meta = {'content_type': 'image/png'}
+
+    async def fake_get_file_by_id(file_id, db=None):
+        assert file_id == '3a1c4e65-ad4e-4096-bb39-13fd52917578'
+        return DummyFile()
+
+    async def fail_fetch_openclaw_worker_json(*args, **kwargs):
+        raise AssertionError('worker endpoint should not be called for remote path-backed attachments')
+
+    monkeypatch.setattr(openai.Files, 'get_file_by_id', fake_get_file_by_id)
+    monkeypatch.setattr(openai, 'fetch_openclaw_worker_json', fail_fetch_openclaw_worker_json)
+
+    result = await openai.maybe_dispatch_openclaw_worker(
+        model='openclaw/main',
+        payload={
+            'input': [
+                {
+                    'type': 'message',
+                    'role': 'user',
+                    'content': [
+                        {'type': 'input_text', 'text': '优化这个图片细节和尺寸。'},
+                        {
+                            'type': 'input_image',
+                            'image_url': '3a1c4e65-ad4e-4096-bb39-13fd52917578',
+                        },
+                    ],
+                }
+            ]
+        },
+        url='http://127.0.0.1:18789/v1',
+        api_config={
+            'worker_api_base_url': 'http://worker.internal:8090',
+        },
+        source_channel='openresponses',
+    )
+
+    assert result is None

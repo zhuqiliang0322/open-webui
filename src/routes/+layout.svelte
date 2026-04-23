@@ -570,7 +570,7 @@
 								form_data
 							);
 
-							if (isResponses && form_data?.model?.startsWith('openclaw/')) {
+							if (form_data?.model?.startsWith('openclaw/')) {
 								const workerSubmission = await submitOpenClawWorker(
 									localStorage.token,
 									form_data.model,

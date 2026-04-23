@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from datetime import datetime
 import hashlib
 import json
@@ -31,9 +32,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from open_webui.internal.db import get_async_session
 
 from open_webui.models.models import Models
+from open_webui.models.files import Files
 from open_webui.models.access_grants import AccessGrants
 from open_webui.models.groups import Groups
 from open_webui.utils.access_control import has_connection_access, check_model_access
+from open_webui.utils.access_control.files import has_access_to_file
 from open_webui.config import (
     CACHE_DIR,
     OPENCLAW_WORKER_API_BASE_URL,
@@ -96,6 +99,15 @@ OPENCLAW_WORKER_INTERMEDIATE_CHILD_RESULT_RE = re.compile(
     r'^(?:now let me|let me |i(?: am|\'m) going to|i will |first[, ]|让我|我将|接下来|需要继续|继续(?:读取|查看|探索)|现在让我)',
     flags=re.IGNORECASE,
 )
+OPENCLAW_WORKER_AUXILIARY_METADATA_TRANSCRIPT_PATTERNS = (
+    re.compile(r'Generate a concise,\s*3-5 word title with an emoji summarizing the chat history\.', flags=re.IGNORECASE),
+    re.compile(r'Suggest 3-5 relevant follow-up questions or prompts', flags=re.IGNORECASE),
+    re.compile(
+        r'Generate 1-3 broad tags categorizing the main themes of the chat history',
+        flags=re.IGNORECASE,
+    ),
+    re.compile(r'Generate a detailed prompt for am image generation task', flags=re.IGNORECASE),
+)
 OPENCLAW_WORKER_ARTIFACT_CODE_SPAN_RE = re.compile(r'`([^`\n]{1,200})`')
 OPENCLAW_WORKER_ARTIFACT_CONTEXT_AGENT_RE = re.compile(
     r'\b(release|heavy|visual|coder|ops|main)\b',
@@ -140,6 +152,17 @@ OPENCLAW_WORKER_ARTIFACT_INLINE_MEDIA_TYPES = {
     'application/xml',
     'image/svg+xml',
 }
+OPENCLAW_WORKER_FILE_ID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+OPENCLAW_WORKER_FILE_PATH_RE = re.compile(
+    r'/api/v\d+/files/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'
+)
+OPENCLAW_WORKER_FILE_TAG_RE = re.compile(r'<file\s+([^>]+?)/?>', flags=re.IGNORECASE)
+OPENCLAW_WORKER_FILE_TAG_ATTR_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_-]*)="([^"]*)"')
+OPENCLAW_WORKER_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tif', '.tiff', '.svg'}
+OPENCLAW_WORKER_DATA_URL_RE = re.compile(r'^data:([\w.+/-]+);base64,(.+)$', re.IGNORECASE | re.DOTALL)
+OPENCLAW_WORKER_LOCAL_HOSTNAMES = {'127.0.0.1', 'localhost'}
+OPENCLAW_WORKER_INPUT_CACHE_MAX_FILES = 128
+OPENCLAW_WORKER_INPUT_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
 ##########################################
@@ -420,6 +443,322 @@ def extract_openclaw_worker_prompt(payload: dict) -> str:
     return str(payload.get('instructions') or '').strip()
 
 
+def extract_openclaw_worker_file_id(value: str) -> str:
+    candidate = str(value or '').strip()
+    if not candidate:
+        return ''
+
+    if OPENCLAW_WORKER_FILE_ID_RE.fullmatch(candidate):
+        return candidate
+
+    parsed = urlparse(candidate)
+    path = parsed.path if (parsed.scheme or candidate.startswith('/')) else candidate
+    match = OPENCLAW_WORKER_FILE_PATH_RE.search(path)
+    if match:
+        return str(match.group(1) or '').strip()
+
+    return ''
+
+
+def parse_openclaw_worker_file_tags(text: str) -> list[dict[str, str]]:
+    source = str(text or '')
+    if '<file' not in source:
+        return []
+
+    entries: list[dict[str, str]] = []
+    for match in OPENCLAW_WORKER_FILE_TAG_RE.finditer(source):
+        attrs_raw = str(match.group(1) or '')
+        attrs = {m.group(1).lower(): m.group(2) for m in OPENCLAW_WORKER_FILE_TAG_ATTR_RE.finditer(attrs_raw)}
+        url = str(attrs.get('url') or '').strip()
+        if not url:
+            continue
+        entries.append(
+            {
+                'url': url,
+                'type': str(attrs.get('content_type') or attrs.get('type') or '').strip(),
+                'name': str(attrs.get('name') or '').strip(),
+            }
+        )
+    return entries
+
+
+def collect_openclaw_worker_attachment_candidates(payload: dict) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+
+    def append_candidate(url: str, media_type: str = '', name: str = ''):
+        normalized_url = str(url or '').strip()
+        if not normalized_url:
+            return
+        candidates.append(
+            {
+                'url': normalized_url,
+                'type': str(media_type or '').strip(),
+                'name': str(name or '').strip(),
+            }
+        )
+
+    def scan_content(content: list | str | None):
+        if isinstance(content, str):
+            for tagged_file in parse_openclaw_worker_file_tags(content):
+                append_candidate(tagged_file.get('url', ''), tagged_file.get('type', ''), tagged_file.get('name', ''))
+            return
+        if not isinstance(content, list):
+            return
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = str(part.get('type') or '').strip().lower()
+            if part_type in {'input_image', 'image_url'}:
+                image_url = part.get('image_url')
+                if isinstance(image_url, dict):
+                    append_candidate(
+                        image_url.get('url', ''),
+                        image_url.get('content_type') or image_url.get('type') or '',
+                        image_url.get('name') or '',
+                    )
+                else:
+                    append_candidate(str(image_url or ''), part.get('content_type') or part.get('mime_type') or '')
+                continue
+            if part_type in {'input_text', 'text', 'output_text'}:
+                for tagged_file in parse_openclaw_worker_file_tags(part.get('text') or ''):
+                    append_candidate(tagged_file.get('url', ''), tagged_file.get('type', ''), tagged_file.get('name', ''))
+
+    for item in payload.get('input') or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get('type') or '').strip() != 'message':
+            continue
+        if str(item.get('role') or '').strip() != 'user':
+            continue
+        scan_content(item.get('content'))
+
+    for message in payload.get('messages') or []:
+        if not isinstance(message, dict):
+            continue
+        if str(message.get('role') or '').strip() != 'user':
+            continue
+        scan_content(message.get('content'))
+        for file_item in message.get('files') or []:
+            if not isinstance(file_item, dict):
+                continue
+            file_payload = file_item.get('file') if isinstance(file_item.get('file'), dict) else {}
+            append_candidate(
+                file_item.get('url') or file_item.get('id') or file_payload.get('id') or '',
+                file_item.get('content_type') or (file_payload.get('meta') or {}).get('content_type') or '',
+                file_item.get('name') or file_payload.get('filename') or '',
+            )
+
+    return candidates
+
+
+def guess_openclaw_worker_attachment_extension(media_type: str, fallback_name: str = '') -> str:
+    normalized_media_type = str(media_type or '').strip().lower()
+    base_media_type = normalized_media_type.split(';', 1)[0]
+    guessed_extension = mimetypes.guess_extension(base_media_type) if base_media_type else None
+    extension = str(guessed_extension or '').strip().lower()
+
+    # Python may return `.jpe`; normalize to a widely supported suffix.
+    if extension == '.jpe':
+        extension = '.jpg'
+
+    if not extension and fallback_name:
+        extension = Path(fallback_name).suffix.lower()
+
+    return extension or '.bin'
+
+
+async def materialize_openclaw_worker_data_url(raw_url: str, fallback_name: str = '') -> Optional[dict]:
+    match = OPENCLAW_WORKER_DATA_URL_RE.match(str(raw_url or '').strip())
+    if not match:
+        return None
+
+    media_type = str(match.group(1) or '').strip().lower()
+    encoded_payload = re.sub(r'\s+', '', str(match.group(2) or ''))
+    if not encoded_payload:
+        return None
+
+    try:
+        file_bytes = await asyncio.to_thread(base64.b64decode, encoded_payload, validate=True)
+    except Exception:
+        log.warning('Failed to decode OpenClaw worker data URL attachment', exc_info=True)
+        return None
+
+    if not file_bytes:
+        return None
+
+    extension = guess_openclaw_worker_attachment_extension(media_type, fallback_name=fallback_name)
+    digest = hashlib.sha256(file_bytes).hexdigest()
+    cache_root = CACHE_DIR / 'openclaw' / 'worker_inputs'
+    await asyncio.to_thread(cache_root.mkdir, parents=True, exist_ok=True)
+
+    file_path = cache_root / f'{digest[:24]}{extension}'
+    if not file_path.exists():
+        await asyncio.to_thread(file_path.write_bytes, file_bytes)
+    await asyncio.to_thread(prune_openclaw_worker_input_cache, cache_root)
+
+    file_name = str(fallback_name or '').strip() or f'openclaw-worker-input{extension}'
+    if not Path(file_name).suffix:
+        file_name = f'{file_name}{extension}'
+
+    return {
+        'path': str(file_path),
+        'type': media_type or None,
+        'name': file_name,
+    }
+
+
+def prune_openclaw_worker_input_cache(
+    cache_root: Path,
+    *,
+    max_files: int = OPENCLAW_WORKER_INPUT_CACHE_MAX_FILES,
+    max_age_seconds: int = OPENCLAW_WORKER_INPUT_CACHE_MAX_AGE_SECONDS,
+) -> None:
+    if max_files < 1 or max_age_seconds < 1:
+        return
+    if not cache_root.is_dir():
+        return
+
+    now = time.time()
+    candidates: list[tuple[float, Path]] = []
+    for path in cache_root.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+
+        age_seconds = now - stat.st_mtime
+        if age_seconds > max_age_seconds:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+
+        candidates.append((stat.st_mtime, path))
+
+    if len(candidates) <= max_files:
+        return
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    for _, path in candidates[max_files:]:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def openclaw_worker_endpoint_is_local(url: str) -> bool:
+    hostname = urlparse(str(url or '').strip()).hostname or ''
+    return hostname in OPENCLAW_WORKER_LOCAL_HOSTNAMES
+
+
+async def resolve_openclaw_worker_attachments(
+    payload: dict,
+    *,
+    user: Optional[UserModel] = None,
+    db: Optional[AsyncSession] = None,
+) -> list[dict]:
+    candidates = collect_openclaw_worker_attachment_candidates(payload)
+    if not candidates:
+        return []
+
+    file_cache: dict[str, object | None] = {}
+    attachments = []
+    seen_keys: set[tuple[str, str, str, str]] = set()
+
+    for candidate in candidates:
+        raw_url = str(candidate.get('url') or '').strip()
+        if not raw_url:
+            continue
+        output_url = raw_url
+        file_id = extract_openclaw_worker_file_id(raw_url)
+        file_record = None
+        if file_id:
+            if file_id not in file_cache:
+                file_item = await Files.get_file_by_id(file_id, db=db)
+                if file_item and user is not None and user.role != 'admin':
+                    has_direct_access = file_item.user_id == user.id
+                    has_shared_access = await has_access_to_file(file_id, 'read', user, db=db)
+                    if not has_direct_access and not has_shared_access:
+                        file_item = None
+                file_cache[file_id] = file_item
+            file_record = file_cache[file_id]
+            if file_record is None:
+                continue
+
+        resolved_type = str(candidate.get('type') or '').strip()
+        resolved_name = str(candidate.get('name') or '').strip()
+        resolved_path = ''
+
+        if file_record:
+            resolved_path = str(getattr(file_record, 'path', '') or '').strip()
+            if not resolved_name:
+                resolved_name = str(getattr(file_record, 'filename', '') or '').strip()
+            if not resolved_type:
+                file_meta = getattr(file_record, 'meta', {}) or {}
+                resolved_type = str(file_meta.get('content_type') or '').strip()
+
+        if not resolved_name and resolved_path:
+            resolved_name = Path(resolved_path).name
+
+        if not resolved_type:
+            lowered_hint = str(candidate.get('type') or '').strip().lower()
+            if lowered_hint in {'image', 'input_image'}:
+                resolved_type = 'image/*'
+
+        if OPENCLAW_WORKER_DATA_URL_RE.match(raw_url):
+            data_url_attachment = await materialize_openclaw_worker_data_url(raw_url, fallback_name=resolved_name)
+            if data_url_attachment:
+                resolved_path = resolved_path or str(data_url_attachment.get('path') or '').strip()
+                if not resolved_type:
+                    resolved_type = str(data_url_attachment.get('type') or '').strip()
+                if not resolved_name:
+                    resolved_name = str(data_url_attachment.get('name') or '').strip()
+                output_url = None
+
+        dedupe_key = (
+            file_id or resolved_path or raw_url,
+            resolved_path,
+            resolved_type.lower(),
+            resolved_name.lower(),
+        )
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+
+        attachments.append(
+            {
+                'id': file_id or None,
+                'url': output_url,
+                'name': resolved_name or None,
+                'type': resolved_type or None,
+                'path': resolved_path or None,
+            }
+        )
+
+    return attachments
+
+
+def openclaw_worker_attachment_is_visual(attachment: dict) -> bool:
+    media_type = str(attachment.get('type') or '').strip().lower()
+    if media_type.startswith('image/') or media_type in {'image', 'image/*'}:
+        return True
+
+    path_or_name = str(attachment.get('path') or attachment.get('name') or '').strip().lower()
+    if path_or_name:
+        suffix = Path(path_or_name).suffix.lower()
+        if suffix in OPENCLAW_WORKER_IMAGE_EXTENSIONS:
+            return True
+
+    return False
+
+
+def openclaw_worker_has_visual_attachments(attachments: list[dict]) -> bool:
+    return any(openclaw_worker_attachment_is_visual(item) for item in attachments if isinstance(item, dict))
+
+
 def looks_like_openclaw_worker_candidate(prompt: str) -> bool:
     normalized = (prompt or '').strip().lower()
     if not normalized:
@@ -431,6 +770,27 @@ def looks_like_openclaw_worker_candidate(prompt: str) -> bool:
             normalized,
         )
     )
+
+
+def looks_like_openclaw_visual_generation_candidate(prompt: str) -> bool:
+    normalized = (prompt or '').strip().lower()
+    if not normalized:
+        return False
+
+    if re.search(
+        r'(dreamina|即梦|text[\s-]?to[\s-]?image|image[\s-]?to[\s-]?image|文生图|图生图|生图|改图|高清化|upscale|image generation|show the image in this chat|submit_id)',
+        normalized,
+    ):
+        return True
+
+    generation_verbs = (
+        r'(生成|做|制作|创建|画|绘制|设计|渲染|来一张|出一张|帮我做|帮我生成|帮我画|generate|make|create|draw|design|render)'
+    )
+    image_targets = (
+        r'(图片|图像|海报|封面|插画|配图|壁纸|横幅|缩略图|效果图|渲染图|poster|banner|cover|illustration|artwork|thumbnail|wallpaper|concept art)'
+    )
+
+    return bool(re.search(fr'({generation_verbs}.*{image_targets}|{image_targets}.*{generation_verbs})', normalized))
 
 
 def is_openclaw_worker_internal_metadata_prompt(prompt: str) -> bool:
@@ -511,6 +871,28 @@ def normalize_openclaw_worker_child_result_preview(text: str | None) -> str:
     if openclaw_worker_child_result_looks_intermediate(normalized):
         return ''
     return normalized
+
+
+def read_openclaw_worker_transcript_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding='utf-8', errors='replace')
+    except Exception:
+        return ''
+
+
+def openclaw_worker_transcript_has_subagent_activity(text: str) -> bool:
+    return 'sessions_spawn' in text or '[Internal task completion event]' in text
+
+
+def openclaw_worker_transcript_mentions_job_id(text: str, job_id: str) -> bool:
+    normalized_job_id = str(job_id or '').strip()
+    return bool(normalized_job_id) and normalized_job_id in text
+
+
+def openclaw_worker_transcript_is_auxiliary_metadata(text: str) -> bool:
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in OPENCLAW_WORKER_AUXILIARY_METADATA_TRANSCRIPT_PATTERNS)
 
 
 def resolve_openclaw_agent_session_entry(root: Path, agent_id: str, session_key: str) -> tuple[dict, Path | None]:
@@ -893,8 +1275,7 @@ def resolve_openclaw_worker_artifact_file_path(path: str) -> Optional[Path]:
     if root is None:
         return None
 
-    work_root = root / 'work'
-    if not openclaw_worker_path_is_within_root(resolved_path, work_root):
+    if not openclaw_worker_path_is_within_root(resolved_path, root / 'work'):
         return None
 
     return resolved_path
@@ -945,6 +1326,7 @@ def resolve_openclaw_worker_transcript_path(job: dict) -> Optional[Path]:
     root = infer_openclaw_root_from_worker_job(job)
     agent_id = str(job.get('agent_id') or '').strip()
     session_key = str(job.get('worker_session_key') or '').strip()
+    job_id = str(job.get('id') or '').strip()
     if root is None or not agent_id or not session_key:
         return None
 
@@ -982,16 +1364,10 @@ def resolve_openclaw_worker_transcript_path(job: dict) -> Optional[Path]:
         except Exception:
             return None
 
-    def has_subagent_activity(path: Path) -> bool:
-        try:
-            text = path.read_text(encoding='utf-8', errors='replace')
-        except Exception:
-            return False
-        return 'sessions_spawn' in text or '[Internal task completion event]' in text
-
     entry = store.get(session_key) if isinstance(store, dict) else None
     primary_path = resolve_entry_path(entry) if isinstance(entry, dict) else None
-    if primary_path and has_subagent_activity(primary_path):
+    primary_text = read_openclaw_worker_transcript_text(primary_path) if primary_path else ''
+    if primary_path and openclaw_worker_transcript_has_subagent_activity(primary_text):
         return primary_path
 
     if not isinstance(store, dict):
@@ -1014,6 +1390,13 @@ def resolve_openclaw_worker_transcript_path(job: dict) -> Optional[Path]:
         transcript_path = resolve_entry_path(candidate_entry)
         if transcript_path is None:
             continue
+        transcript_text = read_openclaw_worker_transcript_text(transcript_path)
+        if not openclaw_worker_transcript_has_subagent_activity(transcript_text):
+            continue
+        if openclaw_worker_transcript_is_auxiliary_metadata(transcript_text):
+            continue
+        if not openclaw_worker_transcript_mentions_job_id(transcript_text, job_id):
+            continue
 
         started_at_ms = candidate_entry.get('startedAt')
         updated_at_ms = candidate_entry.get('updatedAt')
@@ -1032,7 +1415,6 @@ def resolve_openclaw_worker_transcript_path(job: dict) -> Optional[Path]:
 
         candidates.append(
             (
-                0 if has_subagent_activity(transcript_path) else 1,
                 abs(reference_ts - job_timestamp) if job_timestamp and reference_ts else float('inf'),
                 -(updated_at or 0.0),
                 transcript_path,
@@ -1041,7 +1423,7 @@ def resolve_openclaw_worker_transcript_path(job: dict) -> Optional[Path]:
 
     candidates.sort()
     if candidates:
-        return candidates[0][3]
+        return candidates[0][2]
 
     return primary_path
 
@@ -1168,25 +1550,48 @@ def resolve_openclaw_worker_artifact_path(
 def build_openclaw_worker_resolved_artifacts(job: dict) -> list[dict[str, str]]:
     root = infer_openclaw_root_from_worker_job(job)
     final_text = str(job.get('final_visible_text') or '').strip()
-    if root is None or not final_text:
+    if root is None:
         return []
 
     artifacts: list[dict[str, str]] = []
     seen_labels: set[str] = set()
-    for match in OPENCLAW_WORKER_ARTIFACT_CODE_SPAN_RE.finditer(final_text):
-        label = str(match.group(1) or '').strip()
-        if not label or label in seen_labels:
-            continue
-        preferred_agent = infer_openclaw_worker_artifact_context_agent(final_text, label)
-        resolved_path = resolve_openclaw_worker_artifact_path(
-            root,
-            label,
-            preferred_agent=preferred_agent,
-        )
-        if resolved_path is None:
-            continue
-        artifacts.append({'label': label, 'path': str(resolved_path)})
-        seen_labels.add(label)
+    seen_paths: set[str] = set()
+
+    if final_text:
+        for match in OPENCLAW_WORKER_ARTIFACT_CODE_SPAN_RE.finditer(final_text):
+            label = str(match.group(1) or '').strip()
+            if not label or label in seen_labels:
+                continue
+            preferred_agent = infer_openclaw_worker_artifact_context_agent(final_text, label)
+            resolved_path = resolve_openclaw_worker_artifact_path(
+                root,
+                label,
+                preferred_agent=preferred_agent,
+            )
+            if resolved_path is None:
+                continue
+            resolved_path_str = str(resolved_path)
+            artifacts.append({'label': label, 'path': resolved_path_str})
+            seen_labels.add(label)
+            seen_paths.add(resolved_path_str)
+
+    media_candidates = job.get('media_urls')
+    if not isinstance(media_candidates, list):
+        media_candidates = job.get('mediaUrls')
+    if isinstance(media_candidates, list):
+        for candidate in media_candidates:
+            resolved_path = resolve_openclaw_worker_artifact_file_path(str(candidate or '').strip())
+            if resolved_path is None:
+                continue
+            resolved_path_str = str(resolved_path)
+            if resolved_path_str in seen_paths:
+                continue
+            label = resolved_path.name
+            if not label or label in seen_labels:
+                label = resolved_path_str
+            artifacts.append({'label': label, 'path': resolved_path_str})
+            seen_labels.add(label)
+            seen_paths.add(resolved_path_str)
 
     return artifacts
 
@@ -1331,15 +1736,19 @@ def build_openclaw_worker_subagent_progress(job: dict) -> Optional[dict]:
     }
 
 
-def should_dispatch_openclaw_worker(prompt: str, estimate: Optional[dict]) -> bool:
-    if not prompt.strip():
+def should_dispatch_openclaw_worker(prompt: str, estimate: Optional[dict], has_visual_attachments: bool = False) -> bool:
+    normalized_prompt = prompt.strip()
+    if not normalized_prompt and not has_visual_attachments:
         return False
 
-    if is_openclaw_worker_internal_metadata_prompt(prompt):
+    if normalized_prompt and is_openclaw_worker_internal_metadata_prompt(normalized_prompt):
         return False
+
+    if has_visual_attachments:
+        return True
 
     if not isinstance(estimate, dict):
-        return looks_like_openclaw_worker_candidate(prompt)
+        return looks_like_openclaw_worker_candidate(normalized_prompt)
 
     if (
         estimate.get('requiresOrchestration')
@@ -1349,7 +1758,10 @@ def should_dispatch_openclaw_worker(prompt: str, estimate: Optional[dict]) -> bo
     ):
         return True
 
-    return looks_like_openclaw_worker_candidate(prompt)
+    if estimate.get('recommendedJobType') == 'visual_batch' and looks_like_openclaw_visual_generation_candidate(normalized_prompt):
+        return True
+
+    return looks_like_openclaw_worker_candidate(normalized_prompt)
 
 
 def render_openclaw_worker_ack(job: dict, source_channel: str = 'openresponses') -> str:
@@ -1399,22 +1811,29 @@ async def maybe_dispatch_openclaw_worker(
     url: str,
     api_config: Optional[dict],
     source_channel: str,
+    user: Optional[UserModel] = None,
+    db: Optional[AsyncSession] = None,
 ) -> Optional[dict]:
-    if (api_config or {}).get('api_type') != 'responses':
-        return None
-
     if not model.startswith('openclaw/'):
         return None
 
-    hostname = urlparse(url).hostname or ''
-    if hostname not in {'127.0.0.1', 'localhost'}:
+    if not openclaw_worker_endpoint_is_local(url):
         return None
 
     worker_api_base_url, worker_api_token = resolve_openclaw_worker_api_config(api_config)
     if not worker_api_base_url:
         return None
 
+    attachments = await resolve_openclaw_worker_attachments(payload, user=user, db=db)
+    has_visual_attachments = openclaw_worker_has_visual_attachments(attachments)
+    has_local_path_attachments = any(str(item.get('path') or '').strip() for item in attachments if isinstance(item, dict))
+    if has_local_path_attachments and not openclaw_worker_endpoint_is_local(worker_api_base_url):
+        log.warning('Skipping OpenClaw worker dispatch for path-backed attachments because worker endpoint is not local')
+        return None
+
     prompt = extract_openclaw_worker_prompt(payload)
+    if not prompt and has_visual_attachments:
+        prompt = '请基于用户上传图片完成图像处理请求，并直接返回最终图片。'
     if not prompt:
         return None
     prompt_looks_multi_agent = looks_like_openclaw_worker_candidate(prompt)
@@ -1425,6 +1844,17 @@ async def maybe_dispatch_openclaw_worker(
         },
         'allowBackgroundWorkerSubagents': True,
     }
+    if attachments:
+        metadata['attachments'] = [
+            {
+                'name': item.get('name'),
+                'type': item.get('type'),
+                'path': item.get('path'),
+                'url': item.get('url'),
+                'id': item.get('id'),
+            }
+            for item in attachments
+        ]
 
     estimate = None
     try:
@@ -1442,15 +1872,27 @@ async def maybe_dispatch_openclaw_worker(
     except Exception:
         estimate = None
 
-    if not should_dispatch_openclaw_worker(prompt, estimate):
+    if not should_dispatch_openclaw_worker(prompt, estimate, has_visual_attachments=has_visual_attachments):
         return None
 
     if prompt_looks_multi_agent or (estimate or {}).get('requiresOrchestration') or (estimate or {}).get('isMultiAgent'):
         agent_id = 'main'
         job_type = 'agent_task'
     else:
-        agent_id = str((estimate or {}).get('selectedAgent') or '').strip() or 'ops'
-        job_type = str((estimate or {}).get('recommendedJobType') or '').strip() or 'agent_task'
+        default_agent = 'visual' if has_visual_attachments else 'ops'
+        default_job_type = 'visual_batch' if has_visual_attachments else 'agent_task'
+        estimate_agent = str((estimate or {}).get('selectedAgent') or '').strip().lower()
+        estimate_job_type = str((estimate or {}).get('recommendedJobType') or '').strip()
+
+        if has_visual_attachments and estimate_agent in {'', 'main'}:
+            agent_id = default_agent
+        else:
+            agent_id = estimate_agent or default_agent
+
+        if has_visual_attachments and estimate_job_type in {'', 'agent_task'}:
+            job_type = default_job_type
+        else:
+            job_type = estimate_job_type or default_job_type
 
     job = await fetch_openclaw_worker_json(
         worker_api_base_url,
@@ -1926,12 +2368,6 @@ async def get_openclaw_worker_job(
 ):
     _, _, _, _, api_config = await resolve_openai_model_connection(request, user, model)
 
-    if api_config.get('api_type') != 'responses':
-        raise HTTPException(
-            status_code=400,
-            detail='Worker status is only available for Responses connections.',
-        )
-
     worker_api_base_url, worker_api_token = resolve_openclaw_worker_api_config(api_config)
     if not worker_api_base_url:
         raise HTTPException(status_code=503, detail='Worker API is not configured.')
@@ -2010,6 +2446,7 @@ async def submit_openclaw_worker(
         url=url,
         api_config=api_config,
         source_channel='openresponses',
+        user=user,
     )
     if not result:
         return {'handled': False}
@@ -2574,6 +3011,7 @@ async def generate_chat_completion(
                 url=url,
                 api_config=api_config,
                 source_channel='openresponses',
+                user=user,
             )
             if worker_dispatch:
                 return convert_responses_result(worker_dispatch['response'])

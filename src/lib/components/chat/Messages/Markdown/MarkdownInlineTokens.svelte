@@ -3,7 +3,7 @@
 	import { toast } from 'svelte-sonner';
 
 	import type { Token } from 'marked';
-	import { getContext } from 'svelte';
+	import { getContext, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
 
 	const i18n = getContext('i18n');
@@ -20,7 +20,6 @@
 
 	import Image from '$lib/components/common/Image.svelte';
 	import KatexRenderer from './KatexRenderer.svelte';
-	import Source from './Source.svelte';
 	import HtmlToken from './HTMLToken.svelte';
 	import TextToken from './MarkdownInlineTokens/TextToken.svelte';
 	import CodespanToken from './MarkdownInlineTokens/CodespanToken.svelte';
@@ -33,6 +32,10 @@
 	export let tokens: Token[];
 	export let sourceIds = [];
 	export let onSourceClick: Function = () => {};
+
+	const inlineImageObjectUrls = new Set<string>();
+	let inlineImageSrcs: Record<string, string> = {};
+	let inlineImageLoading: Record<string, boolean> = {};
 
 	/**
 	 * Check if a URL is a same-origin note link and return the note ID if so.
@@ -83,6 +86,38 @@
 		triggerArtifactDownload(objectUrl, filename);
 	};
 
+	const showOpenClawWorkerInlineImage = async (path: string) => {
+		const normalizedPath = String(path ?? '').trim();
+		if (!normalizedPath) {
+			return;
+		}
+		if (inlineImageSrcs[normalizedPath] || inlineImageLoading[normalizedPath]) {
+			return;
+		}
+
+		inlineImageLoading = {
+			...inlineImageLoading,
+			[normalizedPath]: true
+		};
+
+		try {
+			const response = await getOpenClawWorkerArtifactContent(localStorage.token, normalizedPath);
+			const objectUrl = URL.createObjectURL(await response.blob());
+			inlineImageObjectUrls.add(objectUrl);
+			inlineImageSrcs = {
+				...inlineImageSrcs,
+				[normalizedPath]: objectUrl
+			};
+		} catch (error) {
+			console.error(error);
+			toast.error($i18n.t('Failed to load image preview.'));
+		} finally {
+			const remaining = { ...inlineImageLoading };
+			delete remaining[normalizedPath];
+			inlineImageLoading = remaining;
+		}
+	};
+
 	/**
 	 * Handle link clicks - intercept same-origin app URLs for in-app navigation
 	 */
@@ -116,6 +151,15 @@
 			// Invalid URL, let browser handle it
 		}
 	};
+
+	onDestroy(() => {
+		for (const objectUrl of inlineImageObjectUrls) {
+			URL.revokeObjectURL(objectUrl);
+		}
+		inlineImageObjectUrls.clear();
+		inlineImageSrcs = {};
+		inlineImageLoading = {};
+	});
 </script>
 
 {#each tokens as token, tokenIdx (tokenIdx)}
@@ -162,7 +206,32 @@
 			>
 		{/if}
 	{:else if token.type === 'image'}
-		<Image src={token.href} alt={token.text} />
+		{@const localFilePath = extractOpenClawWorkerLocalFilePath(token.href)}
+		{#if localFilePath}
+			{@const inlineImageSrc = inlineImageSrcs[localFilePath]}
+			{@const inlineImagePending = !!inlineImageLoading[localFilePath]}
+			{#if inlineImageSrc}
+				<button
+					type="button"
+					class="cursor-pointer"
+					title={localFilePath}
+					on:click={() => openOpenClawWorkerArtifact(localFilePath)}
+				>
+					<Image src={inlineImageSrc} alt={token.text} />
+				</button>
+			{:else}
+				<button
+					type="button"
+					class="codespan cursor-pointer"
+					title={localFilePath}
+					on:click={() => showOpenClawWorkerInlineImage(localFilePath)}
+				>
+					{inlineImagePending ? $i18n.t('Loading image preview...') : $i18n.t('Show image preview')}
+				</button>
+			{/if}
+		{:else}
+			<Image src={token.href} alt={token.text} />
+		{/if}
 	{:else if token.type === 'strong'}
 		<strong><svelte:self id={`${id}-strong`} tokens={token.tokens} {onSourceClick} /></strong>
 	{:else if token.type === 'em'}
