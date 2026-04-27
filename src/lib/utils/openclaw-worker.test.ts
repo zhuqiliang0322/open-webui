@@ -11,8 +11,11 @@ import {
 	getOpenClawWorkerSubagentPhaseKey,
 	getOpenClawWorkerSubagentItems,
 	getOpenClawWorkerPhaseKey,
+	hasOpenClawWorkerDisplayableResult,
 	isOpenClawWorkerRenderableFinalText,
 	isOpenClawWorkerTerminal,
+	shouldPollOpenClawWorkerJob,
+	shouldRenderOpenClawWorkerFinalResult,
 	shouldOpenClawWorkerArtifactInline
 } from './openclaw-worker';
 
@@ -69,6 +72,62 @@ describe('openclaw worker helpers', () => {
 	it('marks terminal jobs correctly', () => {
 		expect(isOpenClawWorkerTerminal({ phase: 'completed', status: 'succeeded' })).toBe(true);
 		expect(isOpenClawWorkerTerminal({ phase: 'running', status: 'running' })).toBe(false);
+	});
+
+	it('renders displayable final results for terminal jobs', () => {
+		expect(
+			shouldRenderOpenClawWorkerFinalResult({
+				phase: 'completed',
+				status: 'succeeded',
+				final_visible_text: '图片已生成。'
+			})
+		).toBe(true);
+		expect(
+			shouldRenderOpenClawWorkerFinalResult({
+				phase: 'failed',
+				status: 'failed',
+				final_visible_text: '任务失败：模型返回错误。'
+			})
+		).toBe(true);
+		expect(
+			shouldRenderOpenClawWorkerFinalResult({
+				phase: 'failed',
+				status: 'failed',
+				final_visible_text: ''
+			})
+		).toBe(false);
+	});
+
+	it('keeps polling successful terminal jobs until a displayable result arrives', () => {
+		const emptyTerminalJob = {
+			phase: 'completed',
+			status: 'succeeded',
+			final_visible_text: ''
+		};
+		const terminalJobWithMedia = {
+			...emptyTerminalJob,
+			media_urls: ['https://example.test/result.png']
+		};
+
+		expect(hasOpenClawWorkerDisplayableResult(emptyTerminalJob)).toBe(false);
+		expect(shouldPollOpenClawWorkerJob(emptyTerminalJob)).toBe(true);
+		expect(hasOpenClawWorkerDisplayableResult(terminalJobWithMedia)).toBe(true);
+		expect(shouldPollOpenClawWorkerJob(terminalJobWithMedia)).toBe(false);
+		expect(shouldRenderOpenClawWorkerFinalResult(terminalJobWithMedia)).toBe(true);
+	});
+
+	it('does not treat malformed artifact or media items as displayable results', () => {
+		const malformedTerminalJob = {
+			phase: 'completed',
+			status: 'succeeded',
+			final_visible_text: '',
+			resolved_artifacts: [{}],
+			media_urls: ['not-a-url']
+		};
+
+		expect(hasOpenClawWorkerDisplayableResult(malformedTerminalJob)).toBe(false);
+		expect(shouldPollOpenClawWorkerJob(malformedTerminalJob)).toBe(true);
+		expect(shouldRenderOpenClawWorkerFinalResult(malformedTerminalJob)).toBe(false);
 	});
 
 	it('treats waiting placeholder text with active subtasks as non-terminal', () => {
@@ -220,6 +279,14 @@ describe('openclaw worker helpers', () => {
 		expect(rendered).toContain(
 			'![orange_cat_poster.png](openwebui://local-file?path=%2FUsers%2Fpanda%2FOpenClaw%2Fdownloads%2Forange_cat_poster.png)'
 		);
+	});
+
+	it('renders remote media urls inline when final text has not included them yet', () => {
+		const rendered = buildOpenClawWorkerRenderableFinalText('', [], [
+			'https://example.test/generated.png'
+		]);
+
+		expect(rendered).toBe('![generated-image-1](https://example.test/generated.png)');
 	});
 
 	it('parses artifact filenames from content disposition headers', () => {

@@ -10,29 +10,33 @@
 		buildOpenClawWorkerStatusHistory,
 		getOpenClawWorkerSubagentItems,
 		getOpenClawWorkerSubagentPhaseKey,
-		isOpenClawWorkerRenderableFinalText,
-		isOpenClawWorkerTerminal
+		isOpenClawWorkerTerminal,
+		shouldPollOpenClawWorkerJob,
+		shouldRenderOpenClawWorkerFinalResult
 	} from '$lib/utils/openclaw-worker';
+	import type { OpenClawWorkerDisplayableJob } from '$lib/utils/openclaw-worker';
 
 	import ContentRenderer from '../ContentRenderer.svelte';
 	import StatusHistory from './StatusHistory.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n = getContext<any>('i18n');
 
 	export let jobId = '';
 	export let modelId = '';
 	export let model = null;
 	export let history;
 	export let messageId = '';
-	export let selectedModels = [];
+	export let selectedModels: string[] = [];
 	export let editCodeBlock = true;
 
-	let job = null;
+	let job: OpenClawWorkerDisplayableJob | null = null;
 	let error = '';
 	let loading = true;
 	let mounted = false;
 	let pollTimer: ReturnType<typeof setTimeout> | null = null;
 	let requestKey = '';
+	let emptyTerminalPolls = 0;
+	const MAX_EMPTY_TERMINAL_POLLS = 40;
 
 	const getParentUserPrompt = (threadHistory: typeof history, currentMessageId: string): string => {
 		const messages = threadHistory?.messages;
@@ -72,14 +76,27 @@
 		}
 
 		try {
-			const nextJob = await getOpenClawWorkerJob(localStorage.token, jobId, modelId);
+			const nextJob = (await getOpenClawWorkerJob(
+				localStorage.token,
+				jobId,
+				modelId
+			)) as OpenClawWorkerDisplayableJob;
 			job = nextJob;
+			emptyTerminalPolls =
+				shouldPollOpenClawWorkerJob(nextJob) && isOpenClawWorkerTerminal(nextJob)
+					? emptyTerminalPolls + 1
+					: 0;
 			error = '';
 		} catch (e) {
 			error = e instanceof Error ? e.message : `${e}`;
 		} finally {
 			loading = false;
-			if (mounted && (error || !isOpenClawWorkerTerminal(job))) {
+			if (
+				mounted &&
+				(error ||
+					!isOpenClawWorkerTerminal(job) ||
+					(shouldPollOpenClawWorkerJob(job) && emptyTerminalPolls <= MAX_EMPTY_TERMINAL_POLLS))
+			) {
 				schedulePoll(error ? 5000 : 3000);
 			}
 		}
@@ -90,6 +107,7 @@
 		job = null;
 		error = '';
 		loading = true;
+		emptyTerminalPolls = 0;
 		void loadJob();
 	};
 
@@ -99,7 +117,7 @@
 		restartPolling();
 
 		const handleVisibilityChange = () => {
-			if (!document.hidden && !isOpenClawWorkerTerminal(job)) {
+			if (!document.hidden && shouldPollOpenClawWorkerJob(job)) {
 				void loadJob();
 			}
 		};
@@ -130,15 +148,18 @@
 	$: subagentCompletedCount = subagentItems.filter((item) => item.state === 'completed').length;
 	$: renderableFinalText = buildOpenClawWorkerRenderableFinalText(
 		job?.final_visible_text,
-		Array.isArray(job?.resolved_artifacts) ? job.resolved_artifacts : []
+		Array.isArray(job?.resolved_artifacts) ? job.resolved_artifacts : [],
+		Array.isArray(job?.media_urls) ? job.media_urls : job?.mediaUrls
 	);
-	$: showFinalResult = Boolean(
-		job &&
-		isOpenClawWorkerTerminal(job) &&
-		isOpenClawWorkerRenderableFinalText(job.final_visible_text)
-	);
+	$: isSuccessfulTerminalJob = Boolean(job && (job?.phase === 'completed' || job?.status === 'succeeded'));
+	$: showFinalResult = Boolean(job && shouldRenderOpenClawWorkerFinalResult(job));
 	$: showEmptyResult = Boolean(
-		job && isOpenClawWorkerTerminal(job) && !showFinalResult && !job?.error_message
+		job &&
+			isSuccessfulTerminalJob &&
+			isOpenClawWorkerTerminal(job) &&
+			!showFinalResult &&
+			!job?.error_message &&
+			(!shouldPollOpenClawWorkerJob(job) || emptyTerminalPolls > MAX_EMPTY_TERMINAL_POLLS)
 	);
 	$: badgeClass =
 		phaseKey === 'Completed'
@@ -316,13 +337,13 @@
 					content={renderableFinalText}
 					{history}
 					{messageId}
-					{selectedModels}
-					done={true}
-					{model}
-					sources={[]}
-					floatingButtons={false}
-					{editCodeBlock}
-					topPadding={false}
+						{selectedModels}
+						done={true}
+						{model}
+						sources={null}
+						floatingButtons={false}
+						{editCodeBlock}
+						topPadding={false}
 				/>
 			</div>
 		{:else if showEmptyResult}

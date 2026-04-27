@@ -6,7 +6,7 @@
 	import { getContext, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
 
-	const i18n = getContext('i18n');
+	const i18n = getContext<any>('i18n');
 
 	import { getOpenClawWorkerArtifactContent } from '$lib/apis/openai';
 	import { WEBUI_BASE_URL } from '$lib/constants';
@@ -30,12 +30,60 @@
 	export let id: string;
 	export let done = true;
 	export let tokens: Token[];
-	export let sourceIds = [];
-	export let onSourceClick: Function = () => {};
+	export let sourceIds: string[] = [];
+	export let onSourceClick: (...args: any[]) => void = () => {};
 
 	const inlineImageObjectUrls = new Set<string>();
 	let inlineImageSrcs: Record<string, string> = {};
 	let inlineImageLoading: Record<string, boolean> = {};
+	let inlineImageAutoRequested: Record<string, boolean> = {};
+
+	const collectOpenClawWorkerLocalImagePaths = (items: Token[] | undefined | null): string[] => {
+		const discovered = new Set<string>();
+
+		const visit = (value: unknown) => {
+			if (!value) {
+				return;
+			}
+			if (Array.isArray(value)) {
+				value.forEach(visit);
+				return;
+			}
+			if (typeof value !== 'object') {
+				return;
+			}
+
+			const token = value as {
+				type?: string;
+				href?: string;
+				tokens?: Token[];
+				items?: unknown[];
+				rows?: unknown[];
+				header?: unknown[];
+			};
+			if (token.type === 'image') {
+				const localFilePath = extractOpenClawWorkerLocalFilePath(token.href);
+				if (localFilePath) {
+					discovered.add(localFilePath);
+				}
+			}
+			if (Array.isArray(token.tokens)) {
+				visit(token.tokens);
+			}
+			if (Array.isArray(token.items)) {
+				visit(token.items);
+			}
+			if (Array.isArray(token.rows)) {
+				visit(token.rows);
+			}
+			if (Array.isArray(token.header)) {
+				visit(token.header);
+			}
+		};
+
+		visit(items ?? []);
+		return Array.from(discovered);
+	};
 
 	/**
 	 * Check if a URL is a same-origin note link and return the note ID if so.
@@ -86,7 +134,12 @@
 		triggerArtifactDownload(objectUrl, filename);
 	};
 
-	const showOpenClawWorkerInlineImage = async (path: string) => {
+	const showOpenClawWorkerInlineImage = async (
+		path: string,
+		options: {
+			quiet?: boolean;
+		} = {}
+	) => {
 		const normalizedPath = String(path ?? '').trim();
 		if (!normalizedPath) {
 			return;
@@ -110,7 +163,9 @@
 			};
 		} catch (error) {
 			console.error(error);
-			toast.error($i18n.t('Failed to load image preview.'));
+			if (!options.quiet) {
+				toast.error($i18n.t('Failed to load image preview.'));
+			}
 		} finally {
 			const remaining = { ...inlineImageLoading };
 			delete remaining[normalizedPath];
@@ -159,14 +214,31 @@
 		inlineImageObjectUrls.clear();
 		inlineImageSrcs = {};
 		inlineImageLoading = {};
+		inlineImageAutoRequested = {};
 	});
+
+	$: {
+		for (const localFilePath of collectOpenClawWorkerLocalImagePaths(tokens)) {
+			if (
+				!inlineImageAutoRequested[localFilePath] &&
+				!inlineImageSrcs[localFilePath] &&
+				!inlineImageLoading[localFilePath]
+			) {
+				inlineImageAutoRequested = {
+					...inlineImageAutoRequested,
+					[localFilePath]: true
+				};
+				void showOpenClawWorkerInlineImage(localFilePath, { quiet: true });
+			}
+		}
+	}
 </script>
 
-{#each tokens as token, tokenIdx (tokenIdx)}
-	{#if token.type === 'escape'}
-		{unescapeHtml(token.text)}
-	{:else if token.type === 'html'}
-		<HtmlToken {id} {token} {onSourceClick} />
+	{#each tokens as token, tokenIdx (tokenIdx)}
+		{#if token.type === 'escape'}
+			{unescapeHtml(token.text)}
+		{:else if token.type === 'html'}
+			<HtmlToken {id} {token} />
 	{:else if token.type === 'link'}
 		{@const localFilePath = extractOpenClawWorkerLocalFilePath(token.href)}
 		{@const noteId = localFilePath ? null : getNoteIdFromHref(token.href)}
@@ -254,8 +326,11 @@
 			frameborder="0"
 			on:load={(e) => {
 				try {
-					e.currentTarget.style.height =
-						e.currentTarget.contentWindow.document.body.scrollHeight + 20 + 'px';
+					const iframe = e.currentTarget as HTMLIFrameElement;
+					const height = iframe.contentWindow?.document.body.scrollHeight;
+					if (height) {
+						iframe.style.height = height + 20 + 'px';
+					}
 				} catch {}
 			}}
 		></iframe>

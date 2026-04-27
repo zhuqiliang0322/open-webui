@@ -3017,6 +3017,16 @@ async def generate_chat_completion(
                 return convert_responses_result(worker_dispatch['response'])
             request_url = f'{url}/responses'
         else:
+            worker_dispatch = await maybe_dispatch_openclaw_worker(
+                model=requested_model_id,
+                payload=payload,
+                url=url,
+                api_config=api_config,
+                source_channel='openresponses',
+                user=user,
+            )
+            if worker_dispatch:
+                return convert_responses_result(worker_dispatch['response'])
             request_url = f'{url}/chat/completions'
     # For Chat Completions, strip image parts from multimodal tool messages
     # (Chat Completions doesn't support images in tool content).

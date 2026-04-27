@@ -49,6 +49,32 @@ export type OpenClawWorkerResolvedArtifact = {
 	path: string;
 };
 
+export type OpenClawWorkerDisplayableJob = {
+	id?: string | null;
+	status?: string | null;
+	phase?: string | null;
+	final_visible_text?: string | null;
+	media_urls?: unknown;
+	mediaUrls?: unknown;
+	resolved_artifacts?: unknown;
+	subagent_progress?: {
+		activeCount?: number | null;
+		items?: Array<{
+			sessionKey?: string | null;
+			agentId?: string | null;
+			state?: string | null;
+			task?: string | null;
+			status?: string | null;
+			resultPreview?: string | null;
+		}>;
+	} | null;
+	status_history?: { phase?: string | null; status?: string | null }[];
+	estimate?: {
+		preferredInitialBatch?: string[] | null;
+	} | null;
+	error_message?: string | null;
+};
+
 const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const normalizeOpenClawWorkerText = (text: string | null | undefined): string => {
@@ -219,6 +245,65 @@ export const isOpenClawWorkerRenderableFinalText = (text: string | null | undefi
 	return normalized !== '' && !WAITING_RESULT_RE.test(normalized);
 };
 
+const hasOpenClawWorkerResolvedArtifacts = (value: unknown): boolean =>
+	Array.isArray(value) &&
+	value.some((item) => {
+		if (!item || typeof item !== 'object') {
+			return false;
+		}
+		const artifact = item as { label?: unknown; path?: unknown };
+		return Boolean(String(artifact.label ?? '').trim() && String(artifact.path ?? '').trim());
+	});
+
+const hasOpenClawWorkerMediaUrls = (value: unknown): boolean =>
+	Array.isArray(value) &&
+	value.some((item) => /^https?:\/\//i.test(String(item ?? '').trim()));
+
+export const hasOpenClawWorkerDisplayableResult = (
+	job: OpenClawWorkerDisplayableJob | null
+): boolean => {
+	if (!job) {
+		return false;
+	}
+
+	return (
+		isOpenClawWorkerRenderableFinalText(job.final_visible_text) ||
+		hasOpenClawWorkerResolvedArtifacts(job.resolved_artifacts) ||
+		hasOpenClawWorkerMediaUrls(job.media_urls) ||
+		hasOpenClawWorkerMediaUrls(job.mediaUrls)
+	);
+};
+
+export const shouldPollOpenClawWorkerJob = (job: OpenClawWorkerDisplayableJob | null): boolean => {
+	if (!job) {
+		return true;
+	}
+
+	if (!isOpenClawWorkerTerminal(job)) {
+		return true;
+	}
+
+	const status = String(job.status ?? '')
+		.trim()
+		.toLowerCase();
+	const phase = String(job.phase ?? '')
+		.trim()
+		.toLowerCase();
+	const succeeded = phase === 'completed' || status === 'succeeded';
+
+	return succeeded && !job.error_message && !hasOpenClawWorkerDisplayableResult(job);
+};
+
+export const shouldRenderOpenClawWorkerFinalResult = (
+	job: OpenClawWorkerDisplayableJob | null
+): boolean => {
+	if (!job || !isOpenClawWorkerTerminal(job)) {
+		return false;
+	}
+
+	return hasOpenClawWorkerDisplayableResult(job);
+};
+
 export const buildOpenClawWorkerLocalFileHref = (path: string): string =>
 	`${OPENCLAW_WORKER_LOCAL_FILE_PROTOCOL}//${OPENCLAW_WORKER_LOCAL_FILE_HOST}?path=${encodeURIComponent(path)}`;
 
@@ -294,7 +379,8 @@ export const buildOpenClawWorkerRenderableFinalText = (
 				path?: string | null;
 		  }>
 		| null
-		| undefined
+		| undefined,
+	mediaUrls: unknown = []
 ): string => {
 	let nextText = String(text ?? '');
 	const resolvedArtifacts = Array.isArray(artifacts)
@@ -325,7 +411,23 @@ export const buildOpenClawWorkerRenderableFinalText = (
 		.filter(Boolean);
 
 	if (inlineImageMarkdown.length > 0) {
-		nextText = `${nextText.trimEnd()}\n\n${inlineImageMarkdown.join('\n\n')}`;
+		nextText = [nextText.trimEnd(), inlineImageMarkdown.join('\n\n')]
+			.filter(Boolean)
+			.join('\n\n');
+	}
+
+	const mediaImageMarkdown = Array.isArray(mediaUrls)
+		? mediaUrls
+				.map((url, index) => String(url ?? '').trim())
+				.filter((url) => /^https?:\/\//i.test(url))
+				.filter((url) => !nextText.includes(url))
+				.map((url, index) => `![generated-image-${index + 1}](${url})`)
+		: [];
+
+	if (mediaImageMarkdown.length > 0) {
+		nextText = [nextText.trimEnd(), mediaImageMarkdown.join('\n\n')]
+			.filter(Boolean)
+			.join('\n\n');
 	}
 
 	return nextText;

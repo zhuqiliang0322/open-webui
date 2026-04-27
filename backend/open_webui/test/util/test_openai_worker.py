@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -121,7 +122,7 @@ async def test_resolve_openclaw_worker_attachments_materializes_data_url(monkeyp
     assert Path(attachment['path']).suffix == '.png'
 
 
-def test_prune_openclaw_worker_input_cache_removes_expired_and_excess_files(tmp_path):
+def test_prune_openclaw_worker_input_cache_removes_expired_and_excess_files(tmp_path, monkeypatch):
     cache_root = tmp_path / 'worker_inputs'
     cache_root.mkdir()
 
@@ -136,6 +137,7 @@ def test_prune_openclaw_worker_input_cache_removes_expired_and_excess_files(tmp_
     trim_path.write_bytes(b'trim')
 
     now = 1_777_000_000
+    monkeypatch.setattr(openai.time, 'time', lambda: now)
     timestamps = {
         old_path: now - 100,
         keep_a: now - 10,
@@ -1540,6 +1542,68 @@ async def test_maybe_dispatch_openclaw_worker_accepts_non_responses_connection(m
     assert result['handled'] is True
     assert result['job']['id'] == 'job-web-chat-123'
     assert '<!-- OpenClaw Worker | job id: `job-web-chat-123` -->' in result['ack']
+
+
+@pytest.mark.asyncio
+async def test_generate_chat_completion_dispatches_worker_for_chat_completion_connection(monkeypatch):
+    captured = {}
+
+    async def fake_get_model_by_id(model_id):
+        return None
+
+    async def fake_check_model_access(user, model_info, bypass_filter):
+        return None
+
+    async def fake_get_headers_and_cookies(request, url, key, api_config, metadata, user=None):
+        return {}, {}
+
+    async def fake_maybe_dispatch_openclaw_worker(**kwargs):
+        captured.update(kwargs)
+        return {
+            'response': openai.build_openclaw_worker_response(
+                kwargs['model'],
+                '<!-- OpenClaw Worker | job id: `job-web-chat-456` -->\n\n已接到你的请求，正在按协作方式处理。',
+            )
+        }
+
+    monkeypatch.setattr(openai.Models, 'get_model_by_id', fake_get_model_by_id)
+    monkeypatch.setattr(openai, 'check_model_access', fake_check_model_access)
+    monkeypatch.setattr(openai, 'get_headers_and_cookies', fake_get_headers_and_cookies)
+    monkeypatch.setattr(openai, 'maybe_dispatch_openclaw_worker', fake_maybe_dispatch_openclaw_worker)
+
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                OPENAI_MODELS={'openclaw/main': {'urlIdx': 0}},
+                config=SimpleNamespace(
+                    OPENAI_API_CONFIGS={'0': {'worker_api_base_url': 'http://127.0.0.1:8090'}},
+                    OPENAI_API_BASE_URLS=['http://127.0.0.1:18789/v1'],
+                    OPENAI_API_KEYS=['test-key'],
+                ),
+            )
+        ),
+    )
+
+    result = await openai.generate_chat_completion(
+        request=request,
+        form_data={
+            'model': 'openclaw/main',
+            'messages': [
+                {
+                    'role': 'user',
+                    'content': '生成一张新年海报 2K分辨率 3d 效果，高级但中国风',
+                }
+            ],
+        },
+        user=SimpleNamespace(id='user-1', name='panda', email='panda@example.local', role='user'),
+    )
+
+    assert result['object'] == 'chat.completion'
+    assert 'job-web-chat-456' in result['choices'][0]['message']['content']
+    assert captured['model'] == 'openclaw/main'
+    assert captured['payload']['messages'][0]['content'] == '生成一张新年海报 2K分辨率 3d 效果，高级但中国风'
+    assert captured['api_config']['worker_api_base_url'] == 'http://127.0.0.1:8090'
 
 
 @pytest.mark.asyncio
