@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -122,6 +124,31 @@ async def test_resolve_openclaw_worker_attachments_materializes_data_url(monkeyp
     assert Path(attachment['path']).suffix == '.png'
 
 
+@pytest.mark.asyncio
+async def test_materialize_openclaw_worker_data_url_refreshes_existing_cache_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(openai, 'CACHE_DIR', tmp_path)
+    image_data_url = (
+        'data:image/png;base64,'
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO6N3ioAAAAASUVORK5CYII='
+    )
+    file_bytes = base64.b64decode(image_data_url.split(',', 1)[1], validate=True)
+    digest = hashlib.sha256(file_bytes).hexdigest()
+    cache_root = tmp_path / 'openclaw' / 'worker_inputs'
+    cache_root.mkdir(parents=True)
+    cached_path = cache_root / f'{digest[:24]}.png'
+    cached_path.write_bytes(file_bytes)
+    old_time = 1_777_000_000
+    os.utime(cached_path, (old_time, old_time))
+    monkeypatch.setattr(openai.time, 'time', lambda: old_time + 25 * 60 * 60)
+
+    attachment = await openai.materialize_openclaw_worker_data_url(image_data_url)
+
+    assert attachment is not None
+    assert Path(attachment['path']) == cached_path
+    assert cached_path.is_file()
+    assert cached_path.stat().st_mtime > old_time
+
+
 def test_prune_openclaw_worker_input_cache_removes_expired_and_excess_files(tmp_path, monkeypatch):
     cache_root = tmp_path / 'worker_inputs'
     cache_root.mkdir()
@@ -204,6 +231,57 @@ async def test_resolve_openclaw_worker_attachments_skips_inaccessible_file_ids(m
     )
 
     assert attachments == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_openclaw_worker_attachments_reads_uploaded_spreadsheet_files(monkeypatch):
+    class DummyFile:
+        user_id = 'user-1'
+        filename = 'storyboard.xlsx'
+        path = '/Users/panda/open-webui/.data/uploads/storyboard.xlsx'
+        meta = {'content_type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}
+
+    class DummyUser:
+        id = 'user-1'
+        role = 'user'
+
+    async def fake_get_file_by_id(file_id, db=None):
+        assert file_id == '3a1c4e65-ad4e-4096-bb39-13fd52917578'
+        return DummyFile()
+
+    async def fake_has_access_to_file(file_id, access_type, user, db=None):
+        assert file_id == '3a1c4e65-ad4e-4096-bb39-13fd52917578'
+        assert access_type == 'read'
+        assert user.id == 'user-1'
+        return False
+
+    monkeypatch.setattr(openai.Files, 'get_file_by_id', fake_get_file_by_id)
+    monkeypatch.setattr(openai, 'has_access_to_file', fake_has_access_to_file)
+
+    attachments = await openai.resolve_openclaw_worker_attachments(
+        {
+            'messages': [{'role': 'user', 'content': '完整读取这个 Excel'}],
+            'files': [
+                {
+                    'type': 'file',
+                    'id': '3a1c4e65-ad4e-4096-bb39-13fd52917578',
+                    'name': 'storyboard.xlsx',
+                    'content_type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                }
+            ],
+        },
+        user=DummyUser(),
+    )
+
+    assert attachments == [
+        {
+            'id': '3a1c4e65-ad4e-4096-bb39-13fd52917578',
+            'url': '3a1c4e65-ad4e-4096-bb39-13fd52917578',
+            'name': 'storyboard.xlsx',
+            'type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'path': '/Users/panda/open-webui/.data/uploads/storyboard.xlsx',
+        }
+    ]
 
 
 def test_should_not_dispatch_openclaw_worker_for_title_generation_prompt():
@@ -1774,6 +1852,83 @@ async def test_maybe_dispatch_openclaw_worker_routes_image_attachment_payload(mo
     assert captured_calls['estimate']['metadata']['attachments'][0]['path'] == '/Users/panda/open-webui/.data/uploads/test-avatar.png'
     assert captured_calls['job']['agent_id'] == 'visual'
     assert captured_calls['job']['job_type'] == 'visual_batch'
+
+
+@pytest.mark.asyncio
+async def test_maybe_dispatch_openclaw_worker_forwards_uploaded_spreadsheet_attachment(monkeypatch):
+    captured_calls = {}
+
+    class DummyFile:
+        filename = 'storyboard.xlsx'
+        path = '/Users/panda/open-webui/.data/uploads/storyboard.xlsx'
+        meta = {'content_type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}
+
+    async def fake_get_file_by_id(file_id, db=None):
+        assert file_id == '3a1c4e65-ad4e-4096-bb39-13fd52917578'
+        return DummyFile()
+
+    async def fake_fetch_openclaw_worker_json(worker_api_base_url, worker_api_token, method, path, payload=None):
+        if path == '/estimate':
+            captured_calls['estimate'] = payload
+            return {
+                'isLongTask': True,
+                'selectedAgent': 'heavy',
+                'recommendedJobType': 'agent_task',
+                'routeReason': ['spreadsheet attachment request'],
+            }
+
+        if path == '/jobs':
+            captured_calls['job'] = payload
+            return {
+                'id': 'job-spreadsheet-123',
+                'agent_id': payload['agent_id'],
+                'selected_model_public': 'qwen3.5-35b',
+                'estimate': {
+                    'selectedAgent': payload['agent_id'],
+                    'routeReason': ['spreadsheet attachment request'],
+                    'preferredInitialBatch': [payload['agent_id']],
+                },
+            }
+
+        raise AssertionError(f'unexpected worker path: {path}')
+
+    monkeypatch.setattr(openai.Files, 'get_file_by_id', fake_get_file_by_id)
+    monkeypatch.setattr(openai, 'fetch_openclaw_worker_json', fake_fetch_openclaw_worker_json)
+
+    result = await openai.maybe_dispatch_openclaw_worker(
+        model='openclaw/main',
+        payload={
+            'messages': [{'role': 'user', 'content': '完整读取这个 Excel 表格并总结所有行。'}],
+            'files': [
+                {
+                    'type': 'file',
+                    'id': '3a1c4e65-ad4e-4096-bb39-13fd52917578',
+                    'name': 'storyboard.xlsx',
+                    'content_type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                }
+            ],
+        },
+        url='http://127.0.0.1:18789/v1',
+        api_config={
+            'api_type': 'responses',
+            'worker_api_base_url': 'http://127.0.0.1:8090',
+        },
+        source_channel='openresponses',
+    )
+
+    assert result is not None
+    assert result['handled'] is True
+    assert result['job']['id'] == 'job-spreadsheet-123'
+    assert captured_calls['estimate']['metadata']['attachments'] == [
+        {
+            'name': 'storyboard.xlsx',
+            'type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'path': '/Users/panda/open-webui/.data/uploads/storyboard.xlsx',
+            'url': '3a1c4e65-ad4e-4096-bb39-13fd52917578',
+            'id': '3a1c4e65-ad4e-4096-bb39-13fd52917578',
+        }
+    ]
+    assert captured_calls['job']['metadata']['attachments'] == captured_calls['estimate']['metadata']['attachments']
 
 
 @pytest.mark.asyncio

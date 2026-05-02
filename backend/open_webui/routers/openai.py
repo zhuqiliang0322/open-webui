@@ -521,7 +521,38 @@ def collect_openclaw_worker_attachment_candidates(payload: dict) -> list[dict[st
                 continue
             if part_type in {'input_text', 'text', 'output_text'}:
                 for tagged_file in parse_openclaw_worker_file_tags(part.get('text') or ''):
-                    append_candidate(tagged_file.get('url', ''), tagged_file.get('type', ''), tagged_file.get('name', ''))
+                    append_candidate(
+                        tagged_file.get('url', ''), tagged_file.get('type', ''), tagged_file.get('name', '')
+                    )
+                continue
+            if part_type in {'input_file', 'file'}:
+                file_payload = part.get('file') if isinstance(part.get('file'), dict) else {}
+                append_candidate(
+                    part.get('file_id')
+                    or part.get('id')
+                    or part.get('url')
+                    or part.get('file_data')
+                    or file_payload.get('id')
+                    or '',
+                    part.get('content_type')
+                    or part.get('mime_type')
+                    or (file_payload.get('meta') or {}).get('content_type')
+                    or '',
+                    part.get('filename') or part.get('name') or file_payload.get('filename') or '',
+                )
+
+    def scan_file_items(file_items: list | None):
+        if not isinstance(file_items, list):
+            return
+        for file_item in file_items:
+            if not isinstance(file_item, dict):
+                continue
+            file_payload = file_item.get('file') if isinstance(file_item.get('file'), dict) else {}
+            append_candidate(
+                file_item.get('url') or file_item.get('id') or file_payload.get('id') or '',
+                file_item.get('content_type') or (file_payload.get('meta') or {}).get('content_type') or '',
+                file_item.get('name') or file_payload.get('filename') or '',
+            )
 
     for item in payload.get('input') or []:
         if not isinstance(item, dict):
@@ -547,6 +578,10 @@ def collect_openclaw_worker_attachment_candidates(payload: dict) -> list[dict[st
                 file_item.get('content_type') or (file_payload.get('meta') or {}).get('content_type') or '',
                 file_item.get('name') or file_payload.get('filename') or '',
             )
+
+    scan_file_items(payload.get('files'))
+    metadata = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+    scan_file_items(metadata.get('files'))
 
     return candidates
 
@@ -594,6 +629,8 @@ async def materialize_openclaw_worker_data_url(raw_url: str, fallback_name: str 
     file_path = cache_root / f'{digest[:24]}{extension}'
     if not file_path.exists():
         await asyncio.to_thread(file_path.write_bytes, file_bytes)
+    else:
+        await asyncio.to_thread(file_path.touch)
     await asyncio.to_thread(prune_openclaw_worker_input_cache, cache_root)
 
     file_name = str(fallback_name or '').strip() or f'openclaw-worker-input{extension}'
