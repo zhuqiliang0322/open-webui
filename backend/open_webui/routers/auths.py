@@ -4,8 +4,11 @@ import uuid
 import time
 import datetime
 import logging
+import ipaddress
+import os
 from aiohttp import ClientSession
 import urllib
+from urllib.parse import urlparse
 
 
 from open_webui.models.auths import (
@@ -95,6 +98,39 @@ log = logging.getLogger(__name__)
 # Forgive us our failed attempts, as we forgive those
 # who exceed their allotted rate against this gate.
 signin_rate_limiter = RateLimiter(redis_client=get_redis_client(), limit=5 * 3, window=60 * 3)
+
+
+def is_local_auto_admin_enabled() -> bool:
+    return os.environ.get('LOCAL_AUTO_ADMIN', 'False').lower() == 'true'
+
+
+def get_local_auto_admin_email() -> str:
+    return os.environ.get('LOCAL_AUTO_ADMIN_EMAIL', '').strip().lower()
+
+
+def is_loopback_request(request: Request) -> bool:
+    host = request.client.host if request.client else ''
+
+    if host == 'localhost':
+        return True
+
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def is_local_browser_origin(request: Request) -> bool:
+    for header in ('origin', 'referer'):
+        value = request.headers.get(header)
+        if not value:
+            continue
+
+        hostname = urlparse(value).hostname
+        if hostname not in {'localhost', '127.0.0.1', '::1'}:
+            return False
+
+    return True
 
 
 async def create_session_response(
@@ -226,6 +262,32 @@ async def get_session_user(
         'status_expires_at': user.status_expires_at,
         'permissions': user_permissions,
     }
+
+
+@router.post('/local-admin/signin', response_model=SessionUserResponse)
+async def local_admin_signin(
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_async_session),
+):
+    if not is_local_auto_admin_enabled():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    if not is_loopback_request(request):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+
+    if not is_local_browser_origin(request):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+
+    email = get_local_auto_admin_email()
+    if not email:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+
+    user = await Users.get_user_by_email(email, db=db)
+    if user is None or user.role != 'admin':
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+
+    return await create_session_response(request, user, db, response, set_cookie=True)
 
 
 ############################

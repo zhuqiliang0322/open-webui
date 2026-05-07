@@ -36,6 +36,7 @@
 		removeDetails,
 		removeAllDetails
 	} from '$lib/utils';
+	import { humanizeOpenAIErrorMessage } from '$lib/utils/openai-errors';
 	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
 	import equal from 'fast-deep-equal';
 
@@ -121,6 +122,7 @@
 	export let selectedModels = [];
 
 	let message: MessageType = structuredClone(history.messages[messageId]);
+	let formattedErrorContent = '';
 	$: if (history.messages) {
 		const source = history.messages[messageId];
 		if (source) {
@@ -134,6 +136,9 @@
 			}
 		}
 	}
+	$: formattedErrorContent = message?.error
+		? humanizeOpenAIErrorMessage(message?.error?.content ?? message.content, $i18n.t.bind($i18n))
+		: '';
 
 	export let siblings;
 
@@ -825,7 +830,9 @@
 							{/if}
 
 							{#if message?.error}
-								<Error content={message?.error?.content ?? message.content} />
+								<Error
+									content={formattedErrorContent || (message?.error?.content ?? message.content)}
+								/>
 							{/if}
 
 							{#if (message?.sources || message?.citations) && (model?.info?.meta?.capabilities?.citations ?? true)}

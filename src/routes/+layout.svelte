@@ -52,7 +52,7 @@
 	import 'tippy.js/dist/tippy.css';
 
 	import { executeToolServer, getBackendConfig, getModels, getVersion } from '$lib/apis';
-	import { getSessionUser, updateUserTimezone, userSignOut } from '$lib/apis/auths';
+	import { getSessionUser, localAdminSignIn, updateUserTimezone, userSignOut } from '$lib/apis/auths';
 	import { getAllTags, getChatList } from '$lib/apis/chats';
 	import { chatCompletion } from '$lib/apis/openai';
 	import {
@@ -111,6 +111,38 @@
 	let heartbeatInterval = null;
 
 	const BREAKPOINT = 768;
+
+	const activateSessionUser = async (sessionUser) => {
+		await user.set(sessionUser);
+		try {
+			await config.set(await getBackendConfig());
+		} catch (error) {
+			console.error('Error refreshing backend config:', error);
+		}
+
+		const timezone = getUserTimezone();
+		if (timezone) {
+			updateUserTimezone(localStorage.token, timezone);
+		}
+
+		if (window.electronAPI?.send) {
+			window.electronAPI
+				.send({
+					type: 'token:update',
+					token: localStorage.token
+				})
+				.catch(() => {});
+		}
+
+		if ($socket?.connected) {
+			$socket.emit('user-join', { auth: { token: localStorage.token } });
+		}
+	};
+
+	const getAuthRedirectPath = () => {
+		const redirect = $page.url.searchParams.get('redirect');
+		return redirect && redirect.startsWith('/') && !redirect.startsWith('//') ? redirect : '/';
+	};
 
 	const setupSocket = async (enableWebsocket) => {
 		const _socket = io(`${WEBUI_BASE_URL}` || undefined, {
@@ -1029,37 +1061,22 @@
 					});
 
 					if (sessionUser) {
-						await user.set(sessionUser);
-						try {
-							await config.set(await getBackendConfig());
-						} catch (error) {
-							console.error('Error refreshing backend config:', error);
-						}
-
-						// Keep user timezone in sync on every app load/refresh
-						const timezone = getUserTimezone();
-						if (timezone) {
-							updateUserTimezone(localStorage.token, timezone);
-						}
-
-						// Relay auth token to desktop app for API access
-						if (window.electronAPI?.send) {
-							window.electronAPI
-								.send({
-									type: 'token:update',
-									token: localStorage.token
-								})
-								.catch(() => {});
-						}
+						await activateSessionUser(sessionUser);
 					} else {
 						// Redirect Invalid Session User to /auth Page
 						localStorage.removeItem('token');
 						await goto(`/auth?redirect=${encodedUrl}`);
 					}
 				} else {
-					// Don't redirect if we're already on the auth page
-					// Needed because we pass in tokens from OAuth logins via URL fragments
-					if ($page.url.pathname !== '/auth') {
+					const sessionUser = await localAdminSignIn().catch(() => null);
+					if (sessionUser?.token) {
+						localStorage.token = sessionUser.token;
+						await activateSessionUser(sessionUser);
+
+						if ($page.url.pathname === '/auth') {
+							await goto(getAuthRedirectPath(), { replaceState: true });
+						}
+					} else if ($page.url.pathname !== '/auth') {
 						await goto(`/auth?redirect=${encodedUrl}`);
 					}
 				}

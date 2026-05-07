@@ -23,6 +23,25 @@ type ResponseUsage = {
 	[other: string]: unknown;
 };
 
+const normalizeResponsesUsage = (
+	usage: Record<string, unknown> | undefined
+): ResponseUsage | null => {
+	if (!usage || typeof usage !== 'object') {
+		return null;
+	}
+
+	const promptTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0);
+	const completionTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? 0);
+	const totalTokens = Number(usage.total_tokens ?? promptTokens + completionTokens);
+
+	return {
+		...usage,
+		prompt_tokens: Number.isFinite(promptTokens) ? promptTokens : 0,
+		completion_tokens: Number.isFinite(completionTokens) ? completionTokens : 0,
+		total_tokens: Number.isFinite(totalTokens) ? totalTokens : 0
+	};
+};
+
 // createOpenAITextStream takes a responseBody with a SSE response,
 // and returns an async generator that emits delta updates with large deltas chunked into random sized chunks
 export async function createOpenAITextStream(
@@ -60,7 +79,6 @@ async function* openAIStreamToIterator(
 
 		try {
 			const parsedData = JSON.parse(data);
-			console.log(parsedData);
 
 			if (parsedData.error) {
 				yield { done: true, value: '', error: parsedData.error };
@@ -79,6 +97,65 @@ async function* openAIStreamToIterator(
 
 			if (parsedData.usage) {
 				yield { done: false, value: '', usage: parsedData.usage };
+				continue;
+			}
+
+			if (typeof parsedData.type === 'string' && parsedData.type.startsWith('response.')) {
+				if (parsedData.type === 'response.output_text.delta') {
+					yield {
+						done: false,
+						value: typeof parsedData.delta === 'string' ? parsedData.delta : ''
+					};
+					continue;
+				}
+
+				if (parsedData.type === 'response.completed') {
+					const response = parsedData.response ?? {};
+					const status = response?.status;
+					const error =
+						response?.error ??
+						(parsedData.error || null) ??
+						(typeof status === 'string' && status !== 'completed'
+							? {
+									message: `Responses API stream ended with status '${status}'.`,
+									type: 'responses_api_error',
+									status
+								}
+							: null);
+
+					if (error) {
+						yield {
+							done: true,
+							value: '',
+							error
+						};
+						break;
+					}
+
+					const usage = normalizeResponsesUsage(response?.usage);
+					if (usage) {
+						yield { done: false, value: '', usage };
+					}
+					yield { done: true, value: '' };
+					break;
+				}
+
+				if (parsedData.type === 'response.failed' || parsedData.type === 'response.incomplete') {
+					yield {
+						done: true,
+						value: '',
+						error: parsedData.response?.error ??
+							parsedData.error ??
+							parsedData.response?.incomplete_details ?? {
+								message:
+									parsedData.type === 'response.incomplete'
+										? 'Responses API stream ended incomplete'
+										: 'Responses API stream failed'
+							}
+					};
+					break;
+				}
+
 				continue;
 			}
 

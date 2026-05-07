@@ -66,6 +66,7 @@
 		displayFileHandler
 	} from '$lib/utils';
 	import { AudioQueue } from '$lib/utils/audio';
+	import { humanizeOpenAIErrorMessage, normalizeChatMessageError } from '$lib/utils/openai-errors';
 
 	import {
 		archiveChatById,
@@ -127,6 +128,20 @@
 	let navbarElement;
 
 	let showEventConfirmation = false;
+
+	const RESPONSES_STREAM_STATUS_ACTION = 'responses_stream';
+	const buildResponsesStreamStatus = (hidden = false) => ({
+		action: RESPONSES_STREAM_STATUS_ACTION,
+		description: '正在准备回复...',
+		done: hidden,
+		hidden
+	});
+	const hideResponsesStreamStatus = (message) => {
+		const latestStatus = message?.statusHistory?.at(-1);
+		if (latestStatus?.action === RESPONSES_STREAM_STATUS_ACTION && latestStatus?.hidden !== true) {
+			message.statusHistory = [...message.statusHistory, buildResponsesStreamStatus(true)];
+		}
+	};
 	let eventConfirmationTitle = '';
 	let eventConfirmationMessage = '';
 	let eventConfirmationInput = false;
@@ -490,7 +505,7 @@
 						}
 					}, 100);
 				} else if (type === 'chat:message:error') {
-					message.error = data.error;
+					message.error = normalizeChatMessageError(data.error, $i18n.t.bind($i18n));
 				} else if (type === 'chat:message:follow_ups') {
 					message.followUps = data.follow_ups;
 
@@ -1674,6 +1689,9 @@
 					console.log('Empty response');
 				} else {
 					message.content += value;
+					if (value) {
+						hideResponsesStreamStatus(message);
+					}
 
 					if (navigator.vibrate && ($settings?.hapticFeedback ?? false)) {
 						navigator.vibrate(5);
@@ -1710,6 +1728,7 @@
 		if (content) {
 			// REALTIME_CHAT_SAVE is disabled
 			message.content = content;
+			hideResponsesStreamStatus(message);
 
 			if (navigator.vibrate && ($settings?.hapticFeedback ?? false)) {
 				navigator.vibrate(5);
@@ -1754,6 +1773,7 @@
 
 		if (done) {
 			message.done = true;
+			hideResponsesStreamStatus(message);
 
 			if ($settings.responseAutoCopy) {
 				copyToClipboard(message.content);
@@ -2007,7 +2027,10 @@
 					model: model.id,
 					modelName: model.name ?? model.id,
 					modelIdx: modelIdx ? modelIdx : _modelIdx,
-					timestamp: Math.floor(Date.now() / 1000) // Unix epoch
+					timestamp: Math.floor(Date.now() / 1000), // Unix epoch
+					...(model.id?.startsWith('openclaw/')
+						? { statusHistory: [buildResponsesStreamStatus()] }
+						: {})
 				};
 
 				// Add message to history and Set currentId to messageId
@@ -2426,7 +2449,6 @@
 	};
 
 	const handleOpenAIError = async (error, responseMessage) => {
-		let errorMessage = '';
 		let innerError;
 
 		if (error) {
@@ -2434,29 +2456,17 @@
 		}
 
 		console.error(innerError);
-		if ('detail' in innerError) {
-			// FastAPI error
-			toast.error(innerError.detail);
-			errorMessage = innerError.detail;
-		} else if ('error' in innerError) {
-			// OpenAI error
-			if ('message' in innerError.error) {
-				toast.error(innerError.error.message);
-				errorMessage = innerError.error.message;
-			} else {
-				toast.error(innerError.error);
-				errorMessage = innerError.error;
-			}
-		} else if ('message' in innerError) {
-			// OpenAI error
-			toast.error(innerError.message);
-			errorMessage = innerError.message;
-		}
+		const errorMessage =
+			humanizeOpenAIErrorMessage(innerError, $i18n.t.bind($i18n)) ||
+			$i18n.t(`Uh-oh! There was an issue with the response.`);
+
+		toast.error(errorMessage.split('\n')[0]);
 
 		responseMessage.error = {
 			content: $i18n.t(`Uh-oh! There was an issue with the response.`) + '\n' + errorMessage
 		};
 		responseMessage.done = true;
+		hideResponsesStreamStatus(responseMessage);
 
 		if (responseMessage.statusHistory) {
 			responseMessage.statusHistory = responseMessage.statusHistory.filter(

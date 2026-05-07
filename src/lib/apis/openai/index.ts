@@ -333,12 +333,16 @@ export const verifyOpenAIConnection = async (
 export const chatCompletion = async (
 	token: string = '',
 	body: object,
-	url: string = `${WEBUI_BASE_URL}/api`
+	url: string = `${WEBUI_BASE_URL}/api`,
+	requestPath: string = '/chat/completions'
 ): Promise<[Response | null, AbortController]> => {
 	const controller = new AbortController();
 	let error = null;
 
-	const res = await fetch(`${url}/chat/completions`, {
+	const endpoint =
+		url.endsWith('/chat/completions') || url.endsWith('/responses') ? url : `${url}${requestPath}`;
+
+	const res = await fetch(endpoint, {
 		signal: controller.signal,
 		method: 'POST',
 		headers: {
@@ -389,6 +393,120 @@ export const generateOpenAIChatCompletion = async (
 	}
 
 	return res;
+};
+
+export const getOpenClawWorkerJob = async (token: string = '', jobId: string, modelId: string) => {
+	let error = null;
+
+	const params = new URLSearchParams({
+		model: modelId
+	});
+
+	const res = await fetch(`${OPENAI_API_BASE_URL}/worker/jobs/${jobId}?${params.toString()}`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` })
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			console.error(err);
+			error = err?.detail ?? err?.error?.message ?? 'Server connection failed';
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+export const getOpenClawWorkerArtifactContent = async (
+	token: string = '',
+	path: string,
+	download: boolean = false,
+	jobId: string | null = null,
+	modelId: string | null = null
+) => {
+	let error = null;
+
+	const params = new URLSearchParams({ path });
+	if (download) {
+		params.set('download', 'true');
+	}
+	if (jobId) {
+		params.set('job_id', jobId);
+	}
+	if (modelId) {
+		params.set('model', modelId);
+	}
+
+	const res = await fetch(`${OPENAI_API_BASE_URL}/worker/artifacts/content?${params.toString()}`, {
+		method: 'GET',
+		headers: {
+			...(token && { authorization: `Bearer ${token}` })
+		}
+	}).catch((err) => {
+		console.error(err);
+		error = err;
+		return null;
+	});
+
+	if (error) {
+		throw error;
+	}
+
+	if (!res?.ok) {
+		const detail = await res
+			?.json()
+			.then((body) => body?.detail ?? 'Server connection failed')
+			.catch(() => 'Server connection failed');
+		throw detail;
+	}
+
+	return res;
+};
+
+export const submitOpenClawWorker = async (
+	token: string = '',
+	model: string,
+	payload: object
+): Promise<{ handled: boolean; ack?: string; response?: object; job?: object }> => {
+	let error = null;
+
+	const res = await fetch(`${OPENAI_API_BASE_URL}/worker/submit`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` })
+		},
+		body: JSON.stringify({
+			model,
+			payload
+		})
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			console.error(err);
+			error = err?.detail ?? err?.error?.message ?? 'Server connection failed';
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res ?? { handled: false };
 };
 
 export const synthesizeOpenAISpeech = async (
